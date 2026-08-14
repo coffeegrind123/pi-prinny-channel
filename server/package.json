@@ -1,0 +1,26 @@
+{
+  "name": "pi-channel-prinny",
+  "version": "0.1.0",
+  "description": "Matrix channel for pi — the sidecar payload, staged and compiled outside the repo",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "prinny-channel": "./bin/prinny-channel.mjs"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@prinny/bot": "github:coffeegrind123/prinny-bot",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
