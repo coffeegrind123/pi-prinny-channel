@@ -262,7 +262,19 @@ export class McpChild {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
+        const seconds = Math.round(timeoutMs / 1000);
+        // `initialize` is the one that times out for a boring reason: a cold
+        // Node importing the Matrix stack off a slow mount, not a broken
+        // channel. Say so, because the bare message sends people looking for a
+        // homeserver problem that is not there.
+        const hint =
+          method === 'initialize'
+            ? ' — the sidecar loads the Matrix stack before it answers, which is' +
+              ' slow on a cold or busy box. Raise it with' +
+              ' `/prinny set connectTimeoutSeconds <n>`, and check' +
+              ' `/prinny log` to see how far it got.'
+            : '';
+        reject(new Error(`${method} timed out after ${seconds}s${hint}`));
       }, timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer, method });

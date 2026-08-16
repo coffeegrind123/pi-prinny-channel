@@ -109,7 +109,20 @@ export type PiSettings = {
   permissionTimeoutSeconds: number;
   /** Seconds before an unanswered tool call to the sidecar gives up. */
   requestTimeoutSeconds: number;
-  /** Seconds allowed for the sidecar's MCP handshake. */
+  /**
+   * Seconds allowed for the sidecar's MCP handshake.
+   *
+   * This has to cover a cold Node process importing the Matrix stack, not a
+   * round trip. Measured 2026-08-16 in this container: importing the built
+   * `server.js` alone takes **27.5s**, and the sidecar answered `initialize` at
+   * 17.9s with the Matrix layer arriving 23.6s after that. The old 30s default
+   * was therefore a coin flip on an idle box and a certain failure on a busy
+   * one — and it fails as `initialize timed out after 30s`, which reads like a
+   * broken channel rather than a slow disk.
+   *
+   * Most of that cost is the runtime living under `~/.pi/agent` on a 9p mount,
+   * where thousands of small `node_modules` files are expensive to stat.
+   */
   connectTimeoutSeconds: number;
 };
 
@@ -120,7 +133,7 @@ export const DEFAULT_SETTINGS: PiSettings = {
   permissionTools: [],
   permissionTimeoutSeconds: 300,
   requestTimeoutSeconds: 120,
-  connectTimeoutSeconds: 30,
+  connectTimeoutSeconds: 120,
 };
 
 const DELIVER_AS: DeliverAs[] = ['followUp', 'steer'];
