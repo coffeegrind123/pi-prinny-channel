@@ -11,9 +11,12 @@
  * of bug worth trusting to a reading of the code.
  *
  * pi is spawned in `--mode json`, where the session emits its events as JSON
- * lines. No model is needed: pi reports an injected message on arrival, in the
- * `queue_update` event if it is still busy, so the assertions hold whether or
- * not a backend is up.
+ * lines, against a stub model on loopback and its own agent directory — so the
+ * run is the same on a developer box with a local GPU and on a CI runner with
+ * no provider at all. It used to be spawned with whatever provider the machine
+ * happened to have; with none, pi emitted `{"type":"session"}` and stopped, and
+ * the delivery assertion failed for a reason that had nothing to do with the
+ * channel.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -23,6 +26,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { after, before, describe, expect, it } from './harness.ts';
+// @ts-expect-error — plain .mjs fixture, no types, deliberately dependency-free
+import { startStubModel } from './fixtures/stub-model.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = dirname(HERE);
@@ -30,6 +35,8 @@ const EXTENSION = join(PACKAGE_ROOT, 'extensions', 'index.ts');
 const FAKE_SIDECAR = join(HERE, 'fixtures', 'fake-sidecar.mjs');
 
 let stateDir: string;
+let piDir: string;
+let stubModel: { baseUrl: string; close: () => Promise<void> } | undefined;
 let events: Array<Record<string, unknown>> = [];
 let channelLog = '';
 
@@ -93,15 +100,57 @@ before(async () => {
   mkdirSync(join(stateDir, 'runtime', 'dist'), { recursive: true });
   writeFileSync(join(stateDir, 'runtime', 'dist', 'server.js'), '');
 
+  // Its own agent directory, so the run does not inherit the developer's
+  // providers, packages or settings — any of which change what pi does here.
+  stubModel = await startStubModel();
+  piDir = mkdtempSync(join(tmpdir(), 'prinny-e2e-pi-'));
+  writeFileSync(
+    join(piDir, 'models.json'),
+    JSON.stringify({
+      providers: {
+        stub: {
+          baseUrl: stubModel!.baseUrl,
+          api: 'openai-completions',
+          // pi hides models it considers unauthenticated, so a keyless local
+          // server still needs a placeholder.
+          apiKey: 'local',
+          compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+          models: [
+            {
+              id: 'stub-1',
+              name: 'stub',
+              contextWindow: 32768,
+              maxTokens: 1024,
+              input: ['text'],
+              reasoning: false,
+            },
+          ],
+        },
+      },
+    })
+  );
+
   const stdout = await new Promise<string>((resolve) => {
     const proc = spawn(
       'pi',
-      ['-e', EXTENSION, '--mode', 'json', 'this prompt is never answered — no backend is running'],
+      [
+        '-e',
+        EXTENSION,
+        '--provider',
+        'stub',
+        '--model',
+        'stub-1',
+        '-nc',
+        '--mode',
+        'json',
+        'a prompt for the stub model',
+      ],
       {
         cwd: PACKAGE_ROOT,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: {
           ...process.env,
+          PI_CODING_AGENT_DIR: piDir,
           PRINNY_STATE_DIR: stateDir,
           PRINNY_SIDECAR_ENTRY: FAKE_SIDECAR,
         },
@@ -157,8 +206,10 @@ before(async () => {
   }
 });
 
-after(() => {
+after(async () => {
+  await stubModel?.close();
   if (stateDir) rmSync(stateDir, { recursive: true, force: true });
+  if (piDir) rmSync(piDir, { recursive: true, force: true });
 });
 
 /**
