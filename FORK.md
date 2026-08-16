@@ -35,7 +35,7 @@ vendor/prinny-channel/
     access-store.ts       allowlist, pairing and room mutations
   server/                 the sidecar: upstream's payload, four edits (below)
   skills/                 two skills, rewritten to route through /prinny
-  tests/                  227 tests, no node_modules
+  tests/                  231 tests, no node_modules
 ```
 
 **Nothing under `vendor/` needs installing.** The extension and `src/` import
@@ -190,6 +190,25 @@ rewrites it whenever the gate mints or prunes a pairing, and its
 key it does not know about is dropped. Settings kept there would vanish the
 first time a stranger messaged the bot.
 
+### The tools are registered only when the channel is configured
+
+Tool schemas are part of the request prefix on **every** turn. Measured
+2026-08-16 by capturing what pi actually put on the wire against a stand-in
+model: the six `prinny_*` tools are **1,470 tokens** — more than pi's own
+`bash`, `read`, `edit` and `write` schemas combined (754), and 4.5% of a
+32,768-token window, charged to every turn forever.
+
+`isConfigured()` already gated the sidecar for exactly this reason: an
+unconfigured channel cannot run, so it does not start one. It now gates
+`registerTools()` too, and a session with no Matrix credentials pays nothing for
+a channel it cannot use.
+
+This does **not** make a configured channel cheaper — all six still register once
+credentials exist, because that is when they are reachable. `tests/tool-budget.ts`
+asserts both directions against the wire rather than against the source, with a
+control (pi's own `bash` present in both runs) so an empty capture cannot pass as
+a pass.
+
 ## Two known hazards
 
 - **One channel per machine, one account per channel.** Two bots signed into the
@@ -211,7 +230,7 @@ node vendor/prinny-channel/server/bin/prinny-channel.mjs --prepare   # once, ~1 
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-227 tests, no `node_modules`, three layers:
+231 tests, no `node_modules`, three layers:
 
 - **Upstream's suite** (access, queue, inbox, mentions, permissions, history,
   stdout guard) ported from vitest onto `node:test` via `tests/harness.ts`, and

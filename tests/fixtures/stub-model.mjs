@@ -76,9 +76,17 @@ function answer(body, res) {
   res.end();
 }
 
-/** Starts the stub on an ephemeral port. Resolves once it is listening. */
+/**
+ * Starts the stub on an ephemeral port. Resolves once it is listening.
+ *
+ * Every request body is kept. A stand-in model is the only place that sees what
+ * pi ACTUALLY put on the wire — the tool schemas included — and the tool surface
+ * is context spent on every turn forever, so it is worth asserting on rather
+ * than reading off the source.
+ */
 export function startStubModel() {
   let answered = 0;
+  const requests = [];
 
   const server = createServer((req, res) => {
     if (req.method === 'GET') {
@@ -90,6 +98,11 @@ export function startStubModel() {
     let body = '';
     req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
+      try {
+        requests.push(JSON.parse(body || '{}'));
+      } catch {
+        // Unparseable bodies are still answered; they just are not measurable.
+      }
       const delay = answered++ === 0 ? FIRST_ANSWER_DELAY_MS : 0;
       setTimeout(() => answer(body, res), delay);
     });
@@ -100,6 +113,8 @@ export function startStubModel() {
       const { port } = server.address();
       resolve({
         baseUrl: `http://127.0.0.1:${port}/v1`,
+        /** Every parsed request body, in arrival order. */
+        requests,
         close: () =>
           new Promise((done) => {
             server.closeAllConnections?.();

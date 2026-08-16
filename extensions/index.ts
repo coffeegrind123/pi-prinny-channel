@@ -1214,7 +1214,24 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   api = pi;
   settings = readSettings();
 
-  registerTools(pi);
+  /**
+   * Six model-callable tools, and their schemas are part of every request's
+   * prefix whether or not this channel is set up. Measured 2026-08-16 by
+   * capturing what pi actually puts on the wire: 1,470 tokens for the six —
+   * more than pi's own bash, read, edit and write schemas combined (754), and
+   * 4.5% of a 32,768-token window, spent on every turn forever.
+   *
+   * `isConfigured()` already gates the sidecar for exactly this reason (see
+   * startSidecar()), so a session with no Matrix credentials was paying for a
+   * channel that could not run. It now pays nothing.
+   *
+   * Note what this does NOT do: a configured channel still registers all six,
+   * because that is when they are genuinely reachable. This buys back the
+   * window for everyone else, not for the Matrix user.
+   */
+  if (isConfigured()) {
+    registerTools(pi);
+  }
 
   /**
    * Command output goes in as a custom *entry*, not a message.
