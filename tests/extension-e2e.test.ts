@@ -33,8 +33,28 @@ let stateDir: string;
 let events: Array<Record<string, unknown>> = [];
 let channelLog = '';
 
-/** Long enough for pi to boot, hand shake, and take the injected turn. */
-const RUN_MS = 12_000;
+/**
+ * The run stops on the thing being measured, not on a stopwatch.
+ *
+ * It used to wait a flat 12s and SIGKILL. That was a race dressed as a test: pi
+ * boots, retries a dead provider with backoff, THEN the sidecar hands shake and
+ * the message is injected, and if any of that lands after the deadline the
+ * SIGKILL takes the unflushed stdout with it — so the failure is an empty event
+ * list and `expected "undefined" to be "string"`, which names neither the
+ * delivery nor the clock. Measured 2026-08-16: the same run needs ~30s here and
+ * passes every assertion at 45s.
+ *
+ * So: watch stdout for the delivery, stop as soon as it arrives, and keep a
+ * ceiling only as a backstop. Fast when it works, and when it does not, the
+ * ceiling is the only thing that was ever in question.
+ */
+const CEILING_MS = 75_000;  // the node test timeout is 90s; leave room to flush
+
+/** The injected text the run is waiting for — see the fake sidecar's payload. */
+const DELIVERY_MARKER = 'hello from matrix';
+
+/** SIGTERM first: pi buffers stdout when it is a pipe, and SIGKILL loses it. */
+const FLUSH_GRACE_MS = 3_000;
 
 /**
  * `pi` has to be on PATH for this to mean anything.
@@ -88,19 +108,33 @@ before(async () => {
       }
     );
     let out = '';
+    let ceiling: ReturnType<typeof setTimeout>;
+    let hardKill: ReturnType<typeof setTimeout> | undefined;
+
+    // pi retries a dead provider indefinitely, which is correct behaviour and
+    // not what is being tested. Ask it to stop once the delivery has landed;
+    // SIGTERM rather than SIGKILL so buffered stdout is flushed on the way out.
+    const stop = (): void => {
+      clearTimeout(ceiling);
+      proc.kill('SIGTERM');
+      hardKill ??= setTimeout(() => proc.kill('SIGKILL'), FLUSH_GRACE_MS);
+    };
+
     proc.stdout.setEncoding('utf8');
     proc.stdout.on('data', (chunk: string) => {
       out += chunk;
+      if (out.includes(DELIVERY_MARKER)) stop();
     });
-    // pi retries a dead provider indefinitely, which is correct behaviour and
-    // not what is being tested. Give it a fixed window and take what arrived.
-    const timer = setTimeout(() => proc.kill('SIGKILL'), RUN_MS);
+
+    ceiling = setTimeout(stop, CEILING_MS);
     proc.on('exit', () => {
-      clearTimeout(timer);
+      clearTimeout(ceiling);
+      if (hardKill) clearTimeout(hardKill);
       resolve(out);
     });
     proc.on('error', () => {
-      clearTimeout(timer);
+      clearTimeout(ceiling);
+      if (hardKill) clearTimeout(hardKill);
       resolve(out);
     });
   });
@@ -168,7 +202,20 @@ describe('extension end to end', () => {
   });
 
   it('turns an inbound Matrix message into pi input', () => {
-    const injected = piInputs().find((text) => text.includes('hello from matrix'));
+    const injected = piInputs().find((text) => text.includes(DELIVERY_MARKER));
+    // Said here rather than as "expected undefined to be string", which names
+    // neither what was delivered nor how far the run got. The two failures worth
+    // telling apart are "the sidecar never handed shake" (empty channel log) and
+    // "pi produced nothing before the ceiling" (no event types).
+    if (injected === undefined) {
+      const types = [...new Set(events.map((event) => String(event.type)))].join(', ') || '(none)';
+      throw new Error(
+        `no pi input contained ${JSON.stringify(DELIVERY_MARKER)}.\n` +
+          `pi event types seen: ${types}\n` +
+          `pi inputs seen: ${JSON.stringify(piInputs())}\n` +
+          `channel log:\n${channelLog.trim() || '(empty)'}`
+      );
+    }
     expect(typeof injected).toBe('string');
     expect(injected).toContain('<channel ');
     expect(injected).toContain('source="prinny"');
