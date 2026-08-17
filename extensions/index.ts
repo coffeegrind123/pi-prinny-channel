@@ -92,6 +92,7 @@ import {
   finalAssistantText,
 } from '../src/forwarding.ts';
 import { renderInboundMessage, roomOf, type ChannelMessage } from '../src/inbound.ts';
+import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
 import {
   describeCall,
@@ -464,6 +465,9 @@ function markLive(userMessageText: string): void {
     ) {
       entry.live = true;
       log(`pi has read the message from ${room}; it may now be answered`);
+      // Now, not on arrival: before this point the message is queued and the
+      // model is working on somebody else's question.
+      refreshTyping();
     }
   }
 }
@@ -520,6 +524,84 @@ async function forwardToMatrix(text: string, why: string): Promise<void> {
 }
 
 /** End of run: send the closing text, unless it has already gone out. */
+/**
+ * The typing indicator, kept alive for as long as the model is actually working.
+ *
+ * The sidecar already sets typing when a message arrives, but Matrix expires it
+ * on its own timeout — 20 seconds by default — and a local 27B model routinely
+ * thinks for longer than that. The indicator therefore lapsed mid-thought and
+ * the sender saw a bot that had gone quiet, which is precisely the moment the
+ * signal exists for.
+ *
+ * Driven from the turn lifecycle rather than by the model: it is not something a
+ * model should have to remember, and as a tool it would cost schema on every
+ * turn to do a job the harness already knows the timing of. `typing` is exposed
+ * by the sidecar but never registered with pi, so it is free.
+ *
+ * Refreshed on a period comfortably shorter than the timeout it asks for, so
+ * there is no window where the indicator has expired but the turn has not ended.
+ */
+const TYPING_TIMEOUT_MS = 20_000;
+const TYPING_REFRESH_MS = 8_000;
+
+let typingTimer: ReturnType<typeof setInterval> | undefined;
+/** Rooms currently told the bot is typing, so the same rooms can be told it stopped. */
+const typingRooms = new Set<string>();
+
+function sendTyping(room: string, active: boolean): void {
+  void callSidecar('typing', {
+    room_id: room,
+    active,
+    timeout_ms: TYPING_TIMEOUT_MS,
+  }).catch(() => {
+    // A typing indicator is never worth failing a turn over.
+  });
+}
+
+/** Rooms that have had their message read and are still owed an answer. */
+function roomsAwaitingAnswer(): string[] {
+  return [...awaitingReply.entries()]
+    .filter(([, entry]) => entry.live && !entry.answered)
+    .map(([room]) => room);
+}
+
+/**
+ * Bring the indicator in line with who is actually waiting.
+ *
+ * Reconciles rather than toggles, so a room that was answered mid-turn stops
+ * even though others carry on, and a stuck indicator cannot outlive the state
+ * that justified it.
+ */
+function applyTyping(plan: { start: string[]; stop: string[] }): void {
+  for (const room of plan.stop) {
+    sendTyping(room, false);
+    typingRooms.delete(room);
+  }
+  for (const room of plan.start) {
+    typingRooms.add(room);
+    // Re-sent every tick, not only on the first: this IS the refresh.
+    sendTyping(room, true);
+  }
+
+  if (typingRooms.size === 0 && typingTimer) {
+    clearInterval(typingTimer);
+    typingTimer = undefined;
+  } else if (typingRooms.size > 0 && !typingTimer) {
+    typingTimer = setInterval(refreshTyping, TYPING_REFRESH_MS);
+    // Never hold the process open for a typing indicator.
+    (typingTimer as unknown as { unref?: () => void }).unref?.();
+  }
+}
+
+function refreshTyping(): void {
+  applyTyping(planTyping(roomsAwaitingAnswer(), typingRooms));
+}
+
+/** Clear every indicator, whatever the state — the end of a turn, or shutdown. */
+function stopTyping(): void {
+  applyTyping(planStopAll(typingRooms));
+}
+
 async function forwardResult(): Promise<void> {
   if (settings.forward === 'result' && lastAssistantText) {
     await forwardToMatrix(lastAssistantText, 'turn result');
@@ -542,6 +624,9 @@ async function forwardResult(): Promise<void> {
     if (entry.live) awaitingReply.delete(room);
   }
   alreadySent.clear();
+  // After the retirement above, so it reconciles against the state that is left
+  // rather than the one that just ended.
+  stopTyping();
 }
 
 // ── Permission relay ─────────────────────────────────────────────────────────

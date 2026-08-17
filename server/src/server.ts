@@ -440,6 +440,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      // Not registered with pi, so it costs the model nothing: the extension
+      // drives it from the turn lifecycle, which is the only thing that knows
+      // when "working on it" starts and stops.
+      name: 'typing',
+      description:
+        'Set or clear the typing indicator in a room. Internal — driven by the harness, not the model.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room_id: ROOM_ID_SCHEMA,
+          active: { type: 'boolean' },
+          timeout_ms: { type: 'number' },
+        },
+        required: ['room_id', 'active'],
+      },
+    },
+    {
       name: 'react',
       description:
         'Add an emoji reaction to a message. Matrix accepts any emoji — there is no whitelist.',
@@ -571,6 +588,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             ? `sent (id: ${eventIds[0]})`
             : `sent ${eventIds.length} parts (ids: ${eventIds.join(', ')})`;
         return { content: [{ type: 'text', text: result }] };
+      }
+
+      case 'typing': {
+        assertTargetRoom(roomId);
+        const active = args.active === true;
+        // Matrix expires a typing indicator on its own timeout, which is the
+        // whole reason this tool exists: the one set when the message arrived
+        // lapses after 20s, and a local 27B model routinely thinks for longer
+        // than that. The caller refreshes on a shorter period than it asks for
+        // here, so the indicator never has a gap.
+        const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : 20_000;
+        await requireBot().api.sendTyping(roomId, active, timeoutMs);
+        return { content: [{ type: 'text', text: active ? 'typing' : 'stopped' }] };
       }
 
       case 'react': {
