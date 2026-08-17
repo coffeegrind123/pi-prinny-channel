@@ -268,11 +268,16 @@ describe('extension end to end', () => {
       );
     }
     expect(typeof injected).toBe('string');
-    expect(injected).toContain('<channel ');
-    expect(injected).toContain('source="prinny"');
-    expect(injected).toContain('room_id="!room:example.org"');
-    expect(injected).toContain('message_id="$evt1"');
-    expect(injected).toContain('</channel>');
+    // The marker, and the message. The routing identifiers that used to ride
+    // along on every message are held by the extension now, so their ABSENCE is
+    // the assertion — if they come back, the per-message cost came back with
+    // them.
+    expect(injected).toContain('[matrix]');
+    expect(injected).toContain(DELIVERY_MARKER);
+    expect(injected).not.toContain('<channel ');
+    expect(injected).not.toContain('room_id=');
+    expect(injected).not.toContain('message_id=');
+    expect(injected).not.toContain('$evt1');
   });
 
   it('records the delivery in the channel log, not on the terminal', () => {

@@ -175,27 +175,31 @@ describe('tool budget', () => {
   });
 
   it('charges an unconfigured session nothing for a channel it cannot use', () => {
-    const leaked = unconfigured.tools.filter((name) => name.startsWith('prinny_'));
+    const leaked = unconfigured.tools.filter((name) => name.startsWith('prinny'));
     expect(leaked).toEqual([]);
   });
 
-  it('still registers the channel tools once credentials exist', () => {
-    const registered = configured.tools.filter((name) => name.startsWith('prinny_')).sort();
-    expect(registered).toEqual([
-      'prinny_download_attachment',
-      'prinny_edit_message',
-      'prinny_fetch_messages',
-      'prinny_react',
-      'prinny_reply',
-      'prinny_search',
-    ]);
+  it('still registers the channel once credentials exist — as ONE tool', () => {
+    const registered = configured.tools.filter((name) => name.startsWith('prinny')).sort();
+    // Six separate tools measured 4,574 chars of schema on the wire. The
+    // gateway is the whole surface now; the other five actions are reached
+    // through its `action` parameter, which costs a word rather than a schema.
+    expect(registered).toEqual(['prinny']);
   });
 
-  it('measures the saving rather than asserting it exists in the abstract', () => {
-    const saved = configured.toolChars - unconfigured.toolChars;
-    // ~5,900 chars / ~1,470 tokens when this was written. Asserted loosely: the
-    // point is that it is large, and editing a description should not fail an
-    // unrelated suite.
-    expect(saved > 3_000).toBe(true);
+  it('reports what the gateway costs, so a regression is visible not inferred', () => {
+    const cost = configured.toolChars - unconfigured.toolChars;
+    // ~1,000 chars / ~250 tokens when this was written, against ~5,900 / ~1,470
+    // for the six-tool surface it replaced. The ceiling is deliberately well
+    // under the old floor: if an edit pushes the single tool back past 2,500
+    // chars, the saving that justified the refactor is gone and this should say
+    // so rather than let it drift back.
+    console.log(`      [budget] channel tool surface: ${cost} chars on the wire`);
+    expect(cost < 2_500).toBe(true);
+  });
+
+  it('still charges an unconfigured session strictly less than a configured one', () => {
+    // The gate itself, independent of how big either surface is.
+    expect(configured.toolChars > unconfigured.toolChars).toBe(true);
   });
 });

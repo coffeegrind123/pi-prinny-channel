@@ -92,7 +92,7 @@ export type PermissionMode = 'off' | 'dangerous' | 'all';
  * calls are excluded — the filter is an allowlist on `type === "text"`, so a
  * content kind added by a future pi is excluded by default rather than leaked.
  *
- * - `off`     nothing is sent unless the model calls `prinny_reply`.
+ * - `off`     nothing is sent unless the model calls `prinny` with action `reply`.
  * - `result`  the closing text of each Matrix-originated turn (the default).
  * - `all`     every assistant text message in the turn, as it completes, so the
  *             sender sees progress on a long task instead of silence.

@@ -50,7 +50,7 @@ export function finalAssistantText(messages: readonly unknown[]): string {
 }
 
 /**
- * Is this user message the `<channel>` block for that pending room?
+ * Is this user message the inbound message pi was handed for that pending room?
  *
  * The question behind it is when a room becomes eligible to receive the
  * assistant's text, and getting it wrong leaks. A Matrix message can arrive
@@ -60,35 +60,35 @@ export function finalAssistantText(messages: readonly unknown[]): string {
  * would be forwarded to whoever just messaged — silently, and from this side
  * invisibly.
  *
- * So eligibility waits for evidence: pi emitting the block as a user message,
- * which is pi saying it has consumed it. Matched on the Matrix event ID, which
- * is unique and appears in the block as an attribute; the room ID is the
- * fallback for a message that somehow arrived without one, because losing the
- * ability to answer at all is a worse trade than a marginally looser match.
+ * So eligibility waits for evidence: pi emitting that exact text as a user
+ * message, which is pi saying it has consumed it.
+ *
+ * Matched on the whole injected string rather than on an identifier parsed out
+ * of it. The old `<channel …>` block published `message_id` as an attribute and
+ * this read it back; dropping those attributes to save ~55 tokens a message
+ * would have left nothing to parse. Comparing against what was actually sent is
+ * also strictly the safer test: an identifier can be *written* by a sender into
+ * their own message body, and the previous implementation needed a start-anchor
+ * and a no-`m`-flag regex specifically to stop someone marking a room live by
+ * typing `message_id="…"` at anyone. There is nothing to forge here — a sender
+ * would have to reproduce the harness's own rendering of their own message,
+ * which gains them nothing.
  */
 export function blockMatches(
   userMessageText: string,
-  entry: { roomId: string; messageId?: string | undefined }
+  entry: { roomId: string; messageId?: string | undefined; injected?: string | undefined }
 ): boolean {
-  // Only the opening tag counts, and only the one this text begins with.
-  //
-  // A plain substring search over the whole message would read the *body* too,
-  // and the body is what a stranger typed. Someone who writes
-  // `message_id="$someone-elses-event"` into a Matrix message would then mark a
-  // room live that pi has not read yet — which is precisely the state this
-  // function exists to establish. Anchored to the start with no `m` flag, so a
-  // `<channel …>` typed into the body is just text.
-  const tag = /^<channel\s([^>]*)>/.exec(userMessageText);
-  if (!tag) return false;
-  const attributes = tag[1] ?? '';
-  if (entry.messageId) return attributes.includes(`message_id="${entry.messageId}"`);
-  return attributes.includes(`room_id="${entry.roomId}"`);
+  if (entry.injected) return userMessageText.trim() === entry.injected.trim();
+  // No record of what was injected: refuse rather than guess. A false positive
+  // here forwards somebody's private terminal work to a stranger, and a false
+  // negative only means the answer has to be sent with the tool.
+  return false;
 }
 
 /**
  * What has already been said to whom, for the length of one run.
  *
- * A model that both writes an answer and calls `prinny_reply` with the same
+ * A model that both writes an answer and calls `prinny(reply)` with the same
  * words is the common case on a small model, not an edge one — the tool
  * description tells it forwarding happens, and it calls the tool anyway. Sending
  * that twice makes the bot look broken, so the text is matched rather than the
