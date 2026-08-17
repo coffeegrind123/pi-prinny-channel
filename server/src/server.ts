@@ -270,7 +270,7 @@ const COMMANDS = [
   { command: 'status', description: 'Check your pairing status' },
   { command: 'compact', description: 'Compact the conversation context' },
   { command: 'stack', description: 'Show local model stack status' },
-  { command: 'loop', description: 'Loop control: status, stats, stop, finish, end' },
+  { command: 'loop', description: 'Loop: goal, prepare, run, start, status, stop, finish' },
 ];
 
 // ── Room helpers ─────────────────────────────────────────────────────────────

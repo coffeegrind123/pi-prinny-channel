@@ -17,6 +17,13 @@
  *
  * ## What is denied, and why each one
  *
+ * Not denied, and worth saying because an earlier version got it wrong:
+ * `/loop start` and `/loop run`. They were refused as "handing over the
+ * machine", which does not survive inspection — an allowlisted sender can
+ * already direct arbitrary work in prose. Only the `--model` flag on them is
+ * refused, because `/model` is refused below and a permitted command must not
+ * become a side door to it.
+ *
  *   prinny   edits the allowlist itself — the escalation from "can message the
  *            bot" to "can decide who may message the bot". This is the exact
  *            request a prompt injection makes, and the sidecar's own
@@ -69,18 +76,39 @@ export const KNOWN_COMMANDS: readonly string[] = [
 ];
 
 /**
- * What a Matrix sender may run.
+ * What a Matrix sender may run. `null` means the whole command.
  *
- * `null` means the whole command; an array restricts it to those first
- * arguments. `/loop` is the case that needs the distinction: stopping an
- * unattended run from a phone is exactly what a channel is for, and starting one
- * is handing over the machine.
+ * `/loop` is allowed in full, including `start` and `run`. An earlier version
+ * refused those on the grounds that starting an unattended run was "handing over
+ * the machine", and that reasoning does not survive inspection: an allowlisted
+ * sender can already direct arbitrary work in prose — bash, edits, anything —
+ * subject only to the permission gate. The boundary is the allowlist, not the
+ * command surface, and refusing `start` protected nothing that a sentence could
+ * not already do.
+ *
+ * What IS true of a loop is that it keeps acting after the sender stops
+ * messaging, which no prose can arrange because the model cannot invoke a
+ * command. That is a blast-radius and cost property, not a security one, and it
+ * is the operator's call rather than this file's — `/loop stop` is one message
+ * away from the same phone.
  */
 export const MATRIX_ALLOWED: Readonly<Record<string, readonly string[] | null>> = {
   compact: null,
   stack: null,
-  loop: ['status', 'stats', 'stop', 'finish', 'end'],
+  loop: null,
 };
+
+/**
+ * Flags that would route around a refusal elsewhere in this table.
+ *
+ * `/loop run --model M` and `/loop prepare --model M` switch the model
+ * (`switchModel` in vendor/pi-loop-mode). `/model` is refused from Matrix
+ * because it changes what the operator is paying for and how it behaves, so
+ * reaching the same switch through a permitted command is a side door, not a
+ * feature. Refused on the flag, which is the thing that was actually decided
+ * against — not on the subcommand, which is useful.
+ */
+export const REFUSED_FLAGS: readonly string[] = ['--model'];
 
 export type MatrixCommand =
   | { kind: 'text' }
@@ -116,6 +144,17 @@ export function classifyMatrixCommand(body: unknown): MatrixCommand {
     };
   }
 
+  const smuggled = REFUSED_FLAGS.find((flag) => new RegExp(`(^|\\s)${flag}(=|\\s|$)`).test(rest));
+  if (smuggled) {
+    return {
+      kind: 'refuse',
+      name,
+      reason:
+        `${smuggled} cannot be set from Matrix — it changes the model for the whole session. ` +
+        `Run /${name} without it, or set the model in the terminal.`,
+    };
+  }
+
   const allowedArgs = MATRIX_ALLOWED[name];
   if (allowedArgs === null) return { kind: 'run', name, text: trimmed };
 
@@ -137,6 +176,6 @@ export function advertisedCommands(): { command: string; description: string }[]
     { command: 'status', description: 'Check your pairing status' },
     { command: 'compact', description: 'Compact the conversation context' },
     { command: 'stack', description: 'Show local model stack status' },
-    { command: 'loop', description: 'Loop control: status, stats, stop, finish, end' },
+    { command: 'loop', description: 'Loop: goal, prepare, run, start, status, stop, finish' },
   ];
 }

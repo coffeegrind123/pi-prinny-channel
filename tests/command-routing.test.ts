@@ -25,14 +25,24 @@ describe('classifyMatrixCommand — what runs', () => {
     expect(out.kind).toBe('run');
   });
 
-  it('allows stopping a loop but not starting one', () => {
-    // The distinction the whole allowlist exists for: ending an unattended run
-    // from a phone is what a channel is for; starting one is handing over the
-    // machine.
-    expect(classifyMatrixCommand('/loop stop').kind).toBe('run');
-    expect(classifyMatrixCommand('/loop status').kind).toBe('run');
-    expect(classifyMatrixCommand('/loop start rewrite everything').kind).toBe('refuse');
-    expect(classifyMatrixCommand('/loop run').kind).toBe('refuse');
+  it('allows the whole loop lifecycle, including starting one', () => {
+    // An earlier version refused start/run as "handing over the machine". That
+    // does not survive: an allowlisted sender can already direct arbitrary work
+    // in prose, so the boundary is the allowlist, not the command surface.
+    for (const sub of ['goal x', 'prepare', 'run', 'start rewrite the docs', 'status', 'stop']) {
+      expect(classifyMatrixCommand(`/loop ${sub}`).kind).toBe('run');
+    }
+  });
+
+  it('refuses the --model side door, which IS a decision made elsewhere', () => {
+    // /model is refused from Matrix; reaching the same switch through a
+    // permitted command would route around that rather than reopen it.
+    const out = classifyMatrixCommand('/loop run --model gpt-whatever');
+    expect(out.kind).toBe('refuse');
+    expect((out as { reason: string }).reason).toContain('--model');
+    expect(classifyMatrixCommand('/loop prepare --model=x').kind).toBe('refuse');
+    // A word that merely contains the flag name is not the flag.
+    expect(classifyMatrixCommand('/loop start fix the --modelling code').kind).toBe('run');
   });
 });
 
