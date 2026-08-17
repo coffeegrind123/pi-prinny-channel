@@ -89,6 +89,7 @@ import {
   SentRegistry,
   assistantTextOfMessage,
   blockMatches,
+  endedWithoutAnswering,
   finalAssistantText,
 } from '../src/forwarding.ts';
 import { renderInboundMessage, roomOf, type ChannelMessage } from '../src/inbound.ts';
@@ -160,6 +161,14 @@ const awaitingReply = new Map<
 >();
 /** The assistant's closing text from the last completed run. */
 let lastAssistantText = '';
+/**
+ * Whether the last run ended with the model producing nothing.
+ *
+ * Recorded at `agent_end` alongside the text, because `agent_settled` does not
+ * carry the messages and this is the one thing that cannot be inferred from the
+ * text alone: "" means both "no answer" and "an answer that was suppressed".
+ */
+let lastRunEndedEmpty = false;
 
 /** In-flight permission requests, keyed by the id the sidecar echoes back. */
 const pendingPermissions = new Map<
@@ -625,6 +634,16 @@ function stopTyping(): void {
 async function forwardResult(): Promise<void> {
   if (settings.forward === 'result' && lastAssistantText) {
     await forwardToMatrix(lastAssistantText, 'turn result');
+  }
+  // The run ended with the model saying nothing. Nothing was sent — see
+  // finalAssistantText — but the operator should know, because from Matrix this
+  // looks like a question that was simply ignored.
+  if (lastRunEndedEmpty && [...awaitingReply.values()].some((entry) => entry.live)) {
+    log('the run ended with an empty assistant turn — nothing forwarded, the model produced no answer');
+    notify(
+      'a Matrix message got no answer: the model ended the turn empty, which usually means the context filled up',
+      'warning'
+    );
   }
   const unanswered = [...awaitingReply.values()].filter(
     (entry) => entry.live && !entry.answered
@@ -1440,7 +1459,9 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   });
 
   pi.on('agent_end', async (event: AgentEndEvent) => {
-    lastAssistantText = finalAssistantText(event.messages ?? []);
+    const messages = event.messages ?? [];
+    lastAssistantText = finalAssistantText(messages);
+    lastRunEndedEmpty = endedWithoutAnswering(messages);
   });
 
   // At `agent_settled`, not `agent_end`: settled is the point at which no

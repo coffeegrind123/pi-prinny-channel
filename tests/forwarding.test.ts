@@ -12,6 +12,7 @@ import {
   SentRegistry,
   assistantTextOfMessage,
   blockMatches,
+  endedWithoutAnswering,
   finalAssistantText,
 } from '../src/forwarding.ts';
 import { renderInboundMessage } from '../src/inbound.ts';
@@ -217,5 +218,56 @@ describe('SentRegistry', () => {
     sent.mark('!a:x', 'hello');
     sent.clear();
     expect(sent.has('!a:x', 'hello')).toBe(false);
+  });
+});
+
+describe('an empty final turn is not an answer', () => {
+  // The real shape, from ~/.pi/agent/sessions on 2026-08-17. A 17,790-character
+  // tool result filled the window; the model returned content: []; pi read that
+  // as a clean successful turn and settled; and the previous turn's
+  // mid-investigation deliberation was delivered to Matrix as the answer.
+  const starvedRun = [
+    { role: 'user', content: [{ type: 'text', text: '[matrix] go deeper into the watermarking' }] },
+    assistant([
+      { type: 'text', text: 'I need to investigate further. Let me check the details.\n\nSo, adding the browser UA consistently works (200, 233KB).' },
+      { type: 'toolCall', id: 't1', name: 'bash', arguments: {} },
+    ]),
+    { role: 'toolResult', content: [{ type: 'text', text: 'x'.repeat(17_790) }] },
+    assistant([]),
+  ];
+
+  it('does not deliver the previous turn as if it were the reply', () => {
+    const text = finalAssistantText(starvedRun);
+    expect(text).toBe('');
+    expect(text).not.toContain('I need to investigate further');
+  });
+
+  it('reports that the run ended without answering', () => {
+    expect(endedWithoutAnswering(starvedRun)).toBe(true);
+  });
+
+  it('still walks back past a trailing TOOL-CALL-ONLY turn, which does have content', () => {
+    // The distinction that makes this safe: a run ending on a tool call has an
+    // answer above it and always did. Only a genuinely empty turn is the signal.
+    const normal = [
+      assistant([{ type: 'text', text: 'Here are the headlines.' }]),
+      assistant([{ type: 'toolCall', id: 't2', name: 'bash', arguments: {} }]),
+    ];
+    expect(endedWithoutAnswering(normal)).toBe(false);
+    expect(finalAssistantText(normal)).toBe('Here are the headlines.');
+  });
+
+  it('treats an empty string body as empty too', () => {
+    expect(endedWithoutAnswering([assistant([{ type: 'text', text: 'hi' }]), assistant('   ')])).toBe(true);
+  });
+
+  it('is false for an ordinary answered run', () => {
+    const answered = [assistant([{ type: 'text', text: 'Done.' }])];
+    expect(endedWithoutAnswering(answered)).toBe(false);
+    expect(finalAssistantText(answered)).toBe('Done.');
+  });
+
+  it('is false when there is no assistant message at all', () => {
+    expect(endedWithoutAnswering([{ role: 'user', content: [] }])).toBe(false);
   });
 });

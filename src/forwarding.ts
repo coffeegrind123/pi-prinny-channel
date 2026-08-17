@@ -40,8 +40,49 @@ export function assistantTextOfMessage(message: unknown): string {
     .trim();
 }
 
-/** The closing text of a finished run: the last assistant message that had any. */
+/**
+ * Did the run end with the model producing nothing at all?
+ *
+ * `content: []` on the final assistant message — no text, no thinking, no tool
+ * call. pi reads that as a clean successful turn (`stopReason: "stop"`, one
+ * output token) and settles the run, but the model did not answer; on this stack
+ * it is the signature of a context that has filled up. Measured across 259
+ * assistant turns: 3 empty turns out of 196 below 87% of the window, 33 out of
+ * 63 at or above it.
+ *
+ * Distinguished from a tool-call-only tail, which is a normal way for a run to
+ * end and DOES have content — see `finalAssistantText`.
+ */
+export function endedWithoutAnswering(messages: readonly unknown[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const value = messages[index] as { role?: unknown; content?: unknown } | undefined;
+    if (!value || value.role !== 'assistant') continue;
+    const content = value.content;
+    if (typeof content === 'string') return content.trim().length === 0;
+    return Array.isArray(content) && content.length === 0;
+  }
+  return false;
+}
+
+/**
+ * The closing text of a finished run: the last assistant message that had any.
+ *
+ * Walking back past a trailing message with no text is deliberate — a run that
+ * ends on a tool call still has an answer above it, and that is what the sender
+ * asked for.
+ *
+ * It stops at an EMPTY final turn, though, and that distinction was paid for.
+ * A 17,790-character tool result filled the window, the model returned
+ * `content: []`, pi settled the run, and this walked back to the previous turn —
+ * which was mid-investigation deliberation ("I need to investigate further. Let
+ * me check the details. So, adding the browser UA consistently works...") — and
+ * delivered it to Matrix as the answer. The sender got a thinking trace.
+ *
+ * An empty final turn does not mean "the answer is further up". It means the
+ * model produced nothing, and there is no answer to send.
+ */
 export function finalAssistantText(messages: readonly unknown[]): string {
+  if (endedWithoutAnswering(messages)) return '';
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const text = assistantTextOfMessage(messages[index]);
     if (text) return text;
