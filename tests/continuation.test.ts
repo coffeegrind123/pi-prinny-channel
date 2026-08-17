@@ -60,7 +60,7 @@ describe('nudgeForEmptyEnding', () => {
   });
 
   it('always forbids more tool calls — that is how the last turn got here', () => {
-    for (const reason of ['produced-no-answer', 'context', 'error', 'unknown'] as const) {
+    for (const reason of ['produced-no-answer', 'context', 'error', 'truncated', 'unknown'] as const) {
       const text = nudgeForEmptyEnding(reason);
       expect(text.toLowerCase()).toContain('answer');
       if (reason !== 'error') expect(text.toLowerCase()).toContain('not call any more tools');
@@ -68,7 +68,7 @@ describe('nudgeForEmptyEnding', () => {
   });
 
   it('stays short, because it is spent from the window that may be the problem', () => {
-    for (const reason of ['produced-no-answer', 'context', 'error', 'unknown'] as const) {
+    for (const reason of ['produced-no-answer', 'context', 'error', 'truncated', 'unknown'] as const) {
       expect(nudgeForEmptyEnding(reason).length < 300).toBe(true);
     }
   });
@@ -98,6 +98,17 @@ describe('nudgeForEmptyEnding', () => {
   it('says nothing extra when there is no question to restate', () => {
     expect(nudgeForEmptyEnding('error')).not.toContain('The question was');
     expect(nudgeForEmptyEnding('error', '   ')).not.toContain('The question was');
+  });
+});
+
+describe('the truncated nudge asks for shorter, not for a restart', () => {
+  it('says it was cut off and asks for a shorter complete answer', () => {
+    const text = nudgeForEmptyEnding('truncated');
+    expect(text).toContain('cut off');
+    expect(text).toContain('shorter');
+    // It already has the material — telling it to "use what you have" would be
+    // the produced-no-answer advice, which is a different problem.
+    expect(text).not.toContain('ran out of context');
   });
 });
 

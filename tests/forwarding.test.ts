@@ -359,3 +359,27 @@ describe('a thinking-only turn is still no answer', () => {
     expect(finalAssistantText(answered)).toBe('Done.');
   });
 });
+
+describe('a truncated turn is named as truncated', () => {
+  // Only possible since forge stopped hardcoding finish_reason to "stop".
+  // Verified on the wire after the patch: llama and forge both report "length"
+  // for a response cut off at max_tokens, and "stop" for one that finished.
+  it('reports the cap, not the context and not a sulk', () => {
+    const out = describeEmptyEnding(
+      [{ role: 'assistant', content: [], stopReason: 'length', usage: { output: 250 } }],
+      43
+    );
+    expect(out.empty).toBe(true);
+    expect((out as { reason: string }).reason).toBe('truncated');
+    expect((out as { detail: string }).detail).toContain('250 tokens');
+    expect((out as { detail: string }).detail).toContain('cut off');
+  });
+
+  it('takes precedence over the token-count reading, which would say the same thing less usefully', () => {
+    const out = describeEmptyEnding(
+      [{ role: 'assistant', content: [], stopReason: 'length', usage: { output: 126 } }],
+      99
+    );
+    expect((out as { reason: string }).reason).toBe('truncated');
+  });
+});

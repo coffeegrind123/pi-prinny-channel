@@ -51,7 +51,7 @@ export const MAX_EMPTY_RETRIES = 2;
 export const MAX_QUESTION_CHARS = 400;
 
 /** Endings worth another attempt. All of them, for now — with different words. */
-export type EmptyReason = 'error' | 'produced-no-answer' | 'context' | 'unknown';
+export type EmptyReason = 'error' | 'truncated' | 'produced-no-answer' | 'context' | 'unknown';
 
 /** Is another attempt allowed for this message? */
 export function shouldRetryEmptyTurn(attemptsSoFar: number): boolean {
@@ -85,6 +85,13 @@ function baseNudge(reason: EmptyReason): string {
       return (
         'You ran out of context before answering. Answer the outstanding question now, ' +
         'briefly, from what you already have. Do not read anything further and do not call any more tools.'
+      );
+    case 'truncated':
+      // It was mid-answer when the cap hit, so it has the material — it needs to
+      // be shorter, not to start again.
+      return (
+        'Your last turn was cut off before you finished. Give the answer again, ' +
+        'complete but much shorter, in plain text. Do not call any more tools.'
       );
     case 'error':
       // A transport failure. Nothing to explain — it never got to think.

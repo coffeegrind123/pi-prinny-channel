@@ -44,6 +44,7 @@ export function assistantTextOfMessage(message: unknown): string {
 export type EmptyEnding =
   | { empty: false }
   | { empty: true; reason: 'error'; detail: string }
+  | { empty: true; reason: 'truncated'; detail: string }
   | { empty: true; reason: 'produced-no-answer'; detail: string }
   | { empty: true; reason: 'context'; detail: string }
   | { empty: true; reason: 'unknown'; detail: string };
@@ -106,6 +107,19 @@ export function describeEmptyEnding(
             return type === 'text' || type === 'toolCall';
           });
     if (!isEmpty) return { empty: false };
+
+    // `length` means the backend hit the token cap mid-output. This only became
+    // distinguishable once patches/forge_reasoning_passthrough.py stopped forge
+    // hardcoding finish_reason to "stop"; before that a truncated turn was
+    // indistinguishable from one the model chose to end.
+    if (value.stopReason === 'length') {
+      const output = typeof value.usage?.output === 'number' ? value.usage.output : 0;
+      return {
+        empty: true,
+        reason: 'truncated',
+        detail: `the model was cut off after ${output} tokens, mid-answer`,
+      };
+    }
 
     if (value.stopReason === 'error') {
       const detail = typeof value.errorMessage === 'string' && value.errorMessage ? value.errorMessage : 'no detail';
