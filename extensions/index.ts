@@ -93,6 +93,12 @@ import {
   finalAssistantText,
 } from '../src/forwarding.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
+import {
+  giveUpMessage,
+  nudgeForEmptyEnding,
+  shouldRetryEmptyTurn,
+  type EmptyReason,
+} from '../src/continuation.ts';
 import { renderInboundMessage, roomOf, type ChannelMessage } from '../src/inbound.ts';
 import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
@@ -158,6 +164,10 @@ const awaitingReply = new Map<
     live: boolean;
     /** Exactly what was handed to pi, which is what `markLive` matches on. */
     injected?: string;
+    /** Rescue attempts spent on this message after an empty turn. */
+    emptyRetries?: number;
+    /** What was actually asked, so a continuation survives a compaction. */
+    question?: string;
   }
 >();
 /** The assistant's closing text from the last completed run. */
@@ -442,6 +452,7 @@ function deliverInbound(message: ChannelMessage): void {
       at: Date.now(),
       answered: false,
       injected: text,
+      question: (message.content ?? '').trim(),
       // Not eligible for forwarding yet — see `markLive`.
       live: false,
     });
@@ -691,21 +702,45 @@ async function forwardResult(): Promise<void> {
   // The run ended with the model saying nothing. Nothing was sent — see
   // finalAssistantText — but the operator should know, because from Matrix this
   // looks like a question that was simply ignored.
+  // A run that ended without an answer is continued rather than abandoned, so a
+  // Matrix question cannot simply never complete. Bounded: see ../src/continuation.ts.
+  let retrying = false;
   if (lastRunEmptyEnding.empty) {
     const detail = lastRunEmptyEnding.detail ?? 'the model returned an empty turn';
+    const reason = (lastRunEmptyEnding.reason ?? 'unknown') as EmptyReason;
     const waiting = [...awaitingReply.entries()].filter(([, entry]) => entry.live);
-    log(`the run ended without an answer (${lastRunEmptyEnding.reason}): ${detail}`);
+    log(`the run ended without an answer (${reason}): ${detail}`);
+
     if (waiting.length > 0) {
-      notify(`a Matrix message got no answer — ${detail}`, 'warning');
-      // Silence is the worst outcome for the person waiting: from Matrix it is
-      // indistinguishable from being ignored. Say what happened, without
-      // inventing an answer and without relaying whatever the model was
-      // thinking about beforehand.
-      for (const [room] of waiting) {
-        void callSidecar('reply', {
-          room_id: room,
-          text: `I did not manage to answer that — ${detail}. Ask again, or narrow it down.`,
-        }).catch((err) => log(`could not report the empty turn to ${room}: ${err}`));
+      const canRetry = waiting.every(([, entry]) => shouldRetryEmptyTurn(entry.emptyRetries ?? 0));
+      if (canRetry && api) {
+        retrying = true;
+        for (const [, entry] of waiting) entry.emptyRetries = (entry.emptyRetries ?? 0) + 1;
+        const attempt = Math.max(...waiting.map(([, entry]) => entry.emptyRetries ?? 1));
+        log(`continuing the run to get an answer (attempt ${attempt})`);
+        notify(`no answer yet — asking the model again (${detail})`, 'info');
+        try {
+          // A follow-up, not a steer: nothing is in flight at agent_settled, and
+          // this must read as the next thing to do rather than an interruption.
+          const question = waiting.map(([, entry]) => entry.question).find(Boolean);
+          api.sendUserMessage(nudgeForEmptyEnding(reason, question), { deliverAs: 'followUp' });
+        } catch (err) {
+          log(`could not continue the run: ${err}`);
+          retrying = false;
+        }
+      }
+
+      if (!retrying) {
+        notify(`a Matrix message got no answer — ${detail}`, 'warning');
+        // Silence is the worst outcome for the person waiting: from Matrix it is
+        // indistinguishable from being ignored. Say what happened, without
+        // inventing an answer and without relaying whatever the model was
+        // thinking about beforehand.
+        for (const [room] of waiting) {
+          void callSidecar('reply', { room_id: room, text: giveUpMessage(detail) }).catch((err) =>
+            log(`could not report the empty turn to ${room}: ${err}`)
+          );
+        }
       }
     }
   }
@@ -723,8 +758,14 @@ async function forwardResult(): Promise<void> {
   // Only rooms pi has actually read are retired. One whose message is still
   // sitting in the queue has not had its turn yet, and dropping it here would
   // mean the answer, when it finally comes, has nowhere to go.
-  for (const [room, entry] of awaitingReply) {
-    if (entry.live) awaitingReply.delete(room);
+  //
+  // A room being retried is in exactly that position: the continuation is about
+  // to produce the answer it is owed, and retiring it now would send that answer
+  // nowhere.
+  if (!retrying) {
+    for (const [room, entry] of awaitingReply) {
+      if (entry.live) awaitingReply.delete(room);
+    }
   }
   alreadySent.clear();
   // After the retirement above, so it reconciles against the state that is left
