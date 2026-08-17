@@ -862,8 +862,22 @@ async function handleInbound(ctx: Context): Promise<void> {
     return;
   }
 
-  // Typing signals "working on it" until the reply lands.
-  void ctx.typing(true).catch(() => undefined);
+  // NOT typing here, deliberately. Arrival is not work.
+  //
+  // This used to set typing the moment a message landed, which is 20 seconds of
+  // "working on it" before pi has necessarily even been handed the message. On a
+  // cold start that gap is enormous: measured on this stack, typing at 08:07:33
+  // and pi first reading the message at 08:09:02 — 89 seconds, of which the
+  // indicator covered the first twenty. The sender saw it appear, vanish, and
+  // then reappear once real work began, which reads as a bot that gave up.
+  //
+  // The extension owns the indicator now, from `agent_start` to `agent_settled`
+  // — the same span the operator sees as "Working…" — and refreshes it so it
+  // cannot lapse mid-turn. Two owners of one signal, where the earlier one is
+  // guessing, is worse than one owner that only speaks when it knows.
+  //
+  // The acknowledgement reaction stays: it is a durable mark on the message that
+  // says "received", which is the true statement available at this point.
   if (access.ackReaction) void ctx.react(access.ackReaction).catch(() => undefined);
 
   const attachment = attachmentMetaOf(ctx);
