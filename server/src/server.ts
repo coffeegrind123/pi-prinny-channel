@@ -254,10 +254,23 @@ async function resolveDeviceId(): Promise<string | undefined> {
   return body.device_id;
 }
 
+/**
+ * The `/` menu a Matrix client shows.
+ *
+ * Kept in step with `src/command-routing.ts`, which decides what actually runs.
+ * Advertising a command the router refuses is worse than not advertising it: the
+ * menu becomes a list of things that answer "run that in the terminal".
+ *
+ * `start`, `help` and `status` are handled here in the sidecar. The rest are pi
+ * commands, executed by the extension.
+ */
 const COMMANDS = [
   { command: 'start', description: 'Welcome and setup guide' },
   { command: 'help', description: 'What this bot can do' },
   { command: 'status', description: 'Check your pairing status' },
+  { command: 'compact', description: 'Compact the conversation context' },
+  { command: 'stack', description: 'Show local model stack status' },
+  { command: 'loop', description: 'Loop control: status, stats, stop, finish, end' },
 ];
 
 // ── Room helpers ─────────────────────────────────────────────────────────────

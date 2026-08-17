@@ -92,6 +92,7 @@ import {
   endedWithoutAnswering,
   finalAssistantText,
 } from '../src/forwarding.ts';
+import { classifyMatrixCommand } from '../src/command-routing.ts';
 import { renderInboundMessage, roomOf, type ChannelMessage } from '../src/inbound.ts';
 import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
@@ -431,7 +432,44 @@ function deliverInbound(message: ChannelMessage): void {
     });
   }
 
+  // A leading slash is decided here, not by the model. `sendUserMessage` passes
+  // `expandPromptTemplates: false`, so a command has never executed from Matrix
+  // — it arrived as literal text. Opening that door needs it opened for named
+  // commands only; see ../src/command-routing.ts for which and why.
+  const command = classifyMatrixCommand(message.content ?? '');
+
+  if (command.kind === 'refuse' && room) {
+    log(`refused /${command.name} from Matrix`);
+    void callSidecar('reply', { room_id: room, text: command.reason }).catch((err) =>
+      log(`could not send a refusal to ${room}: ${err}`)
+    );
+    // Not delivered to the model either. A refused command must not arrive as
+    // text for the model to be talked into running some other way.
+    const pending = awaitingReply.get(room);
+    if (pending) pending.answered = true;
+    return;
+  }
+
   try {
+    if (command.kind === 'run') {
+      log(`running /${command.name} from Matrix`);
+      // The one call in this file that turns Matrix input into harness control.
+      api.sendUserMessage(command.text, {
+        deliverAs: settings.deliverAs,
+        expandPromptTemplates: true,
+      } as Parameters<typeof api.sendUserMessage>[1]);
+      // Command output is rendered in the terminal, not returned as assistant
+      // text, so nothing would otherwise reach the sender. Say what ran.
+      if (room) {
+        void callSidecar('reply', {
+          room_id: room,
+          text: `Ran \`${command.text}\`. Its output stays in the terminal.`,
+        }).catch(() => undefined);
+        const pending = awaitingReply.get(room);
+        if (pending) pending.answered = true;
+      }
+      return;
+    }
     // `followUp` by default: a message arriving mid-turn joins the queue rather
     // than interrupting work the user asked for in the terminal. `steer` is
     // available for people driving pi entirely from Matrix, where interrupting
