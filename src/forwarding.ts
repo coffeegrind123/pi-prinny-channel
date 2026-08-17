@@ -87,8 +87,24 @@ export function describeEmptyEnding(
     if (!value || value.role !== 'assistant') continue;
 
     const content = value.content;
+    // "Said nothing" is not the same as "has no blocks", and the difference
+    // arrived with the forge patch. Before it, a reasoning-only turn reached pi
+    // as `content: []` because forge destroyed the reasoning; now it arrives as
+    // `content: [thinking]`. That is strictly better — the thinking is visible,
+    // and the Matrix forwarder still refuses to relay it — but it is still not
+    // an answer, and a check for an empty array would stop noticing.
+    //
+    // A tool call IS progress: a run ending on one has its answer above it, and
+    // `finalAssistantText` walks back to find it. Only text and tool calls
+    // count.
     const isEmpty =
-      typeof content === 'string' ? content.trim().length === 0 : Array.isArray(content) && content.length === 0;
+      typeof content === 'string'
+        ? content.trim().length === 0
+        : Array.isArray(content) &&
+          !content.some((part) => {
+            const type = (part as { type?: unknown } | null)?.type;
+            return type === 'text' || type === 'toolCall';
+          });
     if (!isEmpty) return { empty: false };
 
     if (value.stopReason === 'error') {

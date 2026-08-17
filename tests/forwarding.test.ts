@@ -321,3 +321,41 @@ describe('describeEmptyEnding — why the run said nothing', () => {
     }
   });
 });
+
+describe('a thinking-only turn is still no answer', () => {
+  // After patches/forge_reasoning_passthrough.py, forge stops destroying a
+  // reasoning-only turn and pi records content: [thinking] instead of []. The
+  // thinking is now visible to the harness — and still never forwarded, because
+  // assistantTextOfMessage allowlists text — but the sender is owed an answer
+  // and the continuation has to keep firing.
+  const thinkingOnly = [
+    { role: 'user', content: [{ type: 'text', text: '[matrix] dive into the watermark thing' }] },
+    assistant([{ type: 'thinking', thinking: 'Let me check whether 391 is prime...' }]),
+  ];
+
+  it('is reported as no answer even though the turn has content', () => {
+    const out = describeEmptyEnding(thinkingOnly, 43);
+    expect(out.empty).toBe(true);
+  });
+
+  it('sends nothing, so the thinking cannot reach Matrix', () => {
+    expect(finalAssistantText(thinkingOnly)).toBe('');
+    expect(assistantTextOfMessage(thinkingOnly[1])).toBe('');
+  });
+
+  it('still treats a tool-call tail as progress, not as silence', () => {
+    // The control. A run ending on a tool call has its answer above it.
+    const withTool = [
+      assistant([{ type: 'text', text: 'Here are the headlines.' }]),
+      assistant([{ type: 'thinking', thinking: 'hmm' }, { type: 'toolCall', id: 't', name: 'bash', arguments: {} }]),
+    ];
+    expect(describeEmptyEnding(withTool, 43).empty).toBe(false);
+    expect(finalAssistantText(withTool)).toBe('Here are the headlines.');
+  });
+
+  it('still treats a normal answer as an answer', () => {
+    const answered = [assistant([{ type: 'thinking', thinking: 'x' }, { type: 'text', text: 'Done.' }])];
+    expect(describeEmptyEnding(answered, 43).empty).toBe(false);
+    expect(finalAssistantText(answered)).toBe('Done.');
+  });
+});
