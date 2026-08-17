@@ -171,6 +171,41 @@ was injected the answer is `false`: guessing forwards private terminal work to a
 stranger, while refusing only means the answer goes out through the tool.
 `blockMatches` in `src/forwarding.ts`, spoofs in the tests.
 
+### The typing indicator follows "Working…", and has to be re-broadcast
+
+The sidecar set typing when a message arrived and left it there. Matrix expires a
+typing indicator on its own timeout — 20s — and a local 27B model routinely
+thinks for longer, so it lapsed mid-thought: the sender saw a bot that had gone
+quiet at exactly the moment the signal exists to say "still working".
+
+Refreshing it turned out to be two problems, not one.
+
+**The timing.** The indicator is now driven from the turn lifecycle — up between
+`agent_start` and `agent_settled`, which is precisely when pi shows "Working…"
+in the terminal. Not gated on whether a reply has been sent: a model that answers
+and keeps working is still working. Gated on `entry.live`, so a turn the operator
+started locally never tells a Matrix sender the bot is busy with something of
+theirs.
+
+**The broadcast.** Re-asserting `typing: true` while already typing is invisible
+to clients. Verified against this homeserver: the first PUT produces an
+`m.typing` EDU and a second one, with the typing set unchanged, produces
+**nothing at all** — Synapse only broadcasts when the set changes. The
+server-side expiry is refreshed so nothing removes the user either, and a client
+that expires its own indicator locally shows typing briefly and then stops for
+the rest of the turn. That is the reported symptom exactly.
+
+So each assertion clears first (`restart: true`), which makes the set genuinely
+change. Measured over a simulated 8s refresh loop: an EDU on every refresh, where
+before only the first produced one.
+
+It costs the model nothing. `typing` is exposed on the sidecar's MCP interface
+but never passed to `pi.registerTool()`, so it is not in the schema —
+`tests/tool-budget.test.ts` reads the tools array off the wire and still reports
+1,333 chars. The reconciliation lives in `src/typing.ts` so it can be tested; it
+reconciles rather than toggles, because rooms do not finish together and a stuck
+typing indicator must not be able to outlive the state that justified it.
+
 ### Access management is a command, not a skill
 
 Upstream's `/prinny:access` was a skill instructing the model to read

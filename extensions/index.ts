@@ -553,15 +553,35 @@ function sendTyping(room: string, active: boolean): void {
     room_id: room,
     active,
     timeout_ms: TYPING_TIMEOUT_MS,
+    // Every assertion clears first, because re-asserting an unchanged typing
+    // set broadcasts nothing — see the tool in ../server/src/server.ts.
+    restart: active,
   }).catch(() => {
     // A typing indicator is never worth failing a turn over.
   });
 }
 
-/** Rooms that have had their message read and are still owed an answer. */
+/** True while pi is actually running a turn — what the operator sees as "Working…". */
+let agentRunning = false;
+
+/**
+ * Rooms that should see a typing indicator right now.
+ *
+ * Two conditions, and both matter. `agentRunning` is the timing: the indicator
+ * should be up for exactly as long as pi shows "Working…", which is the honest
+ * answer to "is it still thinking about this?" — and notably NOT gated on
+ * whether a reply has already been sent, because a model that answers and keeps
+ * working is still working.
+ *
+ * `entry.live` is the audience: only a room whose message pi has actually taken
+ * as input. Without it a turn the operator started in the terminal would show
+ * somebody on Matrix that the bot is busy with something of theirs, which is
+ * both untrue and a small leak of when the operator is at the keyboard.
+ */
 function roomsAwaitingAnswer(): string[] {
+  if (!agentRunning) return [];
   return [...awaitingReply.entries()]
-    .filter(([, entry]) => entry.live && !entry.answered)
+    .filter(([, entry]) => entry.live)
     .map(([room]) => room);
 }
 
@@ -1382,6 +1402,10 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   // the auto-reply — which have no event of their own to ride on.
   pi.on('agent_start', async (_event, ctx) => {
     uiCtx = ctx;
+    // "Working…" is up from here. A room already live from an earlier queued
+    // message starts showing typing again immediately.
+    agentRunning = true;
+    refreshTyping();
   });
 
   /**
@@ -1424,6 +1448,11 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   // hand is the run's actual answer rather than an intermediate one that a
   // retry is about to replace.
   pi.on('agent_settled', async () => {
+    // Cleared before forwarding, so the indicator is down by the time the answer
+    // lands rather than a beat after it — a bot still "typing" next to a
+    // finished reply reads as though more is coming.
+    agentRunning = false;
+    stopTyping();
     await forwardResult();
   });
 

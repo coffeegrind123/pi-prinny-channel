@@ -452,6 +452,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           room_id: ROOM_ID_SCHEMA,
           active: { type: 'boolean' },
           timeout_ms: { type: 'number' },
+          restart: { type: 'boolean' },
         },
         required: ['room_id', 'active'],
       },
@@ -593,13 +594,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'typing': {
         assertTargetRoom(roomId);
         const active = args.active === true;
-        // Matrix expires a typing indicator on its own timeout, which is the
-        // whole reason this tool exists: the one set when the message arrived
-        // lapses after 20s, and a local 27B model routinely thinks for longer
-        // than that. The caller refreshes on a shorter period than it asks for
-        // here, so the indicator never has a gap.
         const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : 20_000;
-        await requireBot().api.sendTyping(roomId, active, timeoutMs);
+        const api = requireBot().api;
+
+        // Re-asserting `typing: true` while already typing is INVISIBLE to
+        // clients. Verified against this homeserver: the first PUT produces an
+        // `m.typing` EDU, and a second one while the set is unchanged produces
+        // nothing at all — Synapse only broadcasts when the set of typing users
+        // changes. The server-side expiry is refreshed, so nothing ever removes
+        // the user either, and a client that expires its own indicator locally
+        // shows typing briefly and then stops for the rest of the turn. That is
+        // exactly the reported symptom.
+        //
+        // Clearing first makes the set genuinely change, so the re-assert
+        // broadcasts. The two PUTs are adjacent, so the gap a client could
+        // notice is one request wide.
+        if (active && args.restart === true) {
+          await api.sendTyping(roomId, false, 0);
+        }
+        await api.sendTyping(roomId, active, timeoutMs);
         return { content: [{ type: 'text', text: active ? 'typing' : 'stopped' }] };
       }
 
