@@ -40,28 +40,87 @@ export function assistantTextOfMessage(message: unknown): string {
     .trim();
 }
 
+/** Why a run ended with the model saying nothing, as far as the record shows. */
+export type EmptyEnding =
+  | { empty: false }
+  | { empty: true; reason: 'error'; detail: string }
+  | { empty: true; reason: 'produced-no-answer'; detail: string }
+  | { empty: true; reason: 'context'; detail: string }
+  | { empty: true; reason: 'unknown'; detail: string };
+
 /**
- * Did the run end with the model producing nothing at all?
+ * Did the run end with the model producing nothing, and if so on what evidence?
  *
  * `content: []` on the final assistant message — no text, no thinking, no tool
- * call. pi reads that as a clean successful turn (`stopReason: "stop"`, one
- * output token) and settles the run, but the model did not answer; on this stack
- * it is the signature of a context that has filled up. Measured across 259
- * assistant turns: 3 empty turns out of 196 below 87% of the window, 33 out of
- * 63 at or above it.
+ * call. pi reads that as a clean successful turn and settles the run, but there
+ * is no answer to send.
+ *
+ * The REASON matters, because an earlier version of this asserted one cause for
+ * all of them ("the context filled up") and was then watched being wrong. Three
+ * distinct endings have now been observed on this stack, and they want different
+ * responses:
+ *
+ *   context             out: 1 at 99% of the window. The documented cliff — 33
+ *                       empty turns of 63 at or above 87%, against 3 of 196
+ *                       below it.
+ *   produced-no-answer  out: 126 at 43% of the window, stopReason "stop",
+ *                       content []. The model generated over a hundred tokens
+ *                       and none of them became an answer. Nothing to do with
+ *                       room; on a reasoning model the likely reading is that it
+ *                       thought and then stopped, but this only claims what the
+ *                       record shows.
+ *   error               stopReason "error", zero tokens either way. A stream
+ *                       that ended without a finish_reason. A transport failure,
+ *                       not the model declining to speak.
  *
  * Distinguished from a tool-call-only tail, which is a normal way for a run to
  * end and DOES have content — see `finalAssistantText`.
  */
-export function endedWithoutAnswering(messages: readonly unknown[]): boolean {
+export function describeEmptyEnding(
+  messages: readonly unknown[],
+  contextPercent?: number | null
+): EmptyEnding {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const value = messages[index] as { role?: unknown; content?: unknown } | undefined;
+    const value = messages[index] as
+      | { role?: unknown; content?: unknown; stopReason?: unknown; usage?: { output?: unknown }; errorMessage?: unknown }
+      | undefined;
     if (!value || value.role !== 'assistant') continue;
+
     const content = value.content;
-    if (typeof content === 'string') return content.trim().length === 0;
-    return Array.isArray(content) && content.length === 0;
+    const isEmpty =
+      typeof content === 'string' ? content.trim().length === 0 : Array.isArray(content) && content.length === 0;
+    if (!isEmpty) return { empty: false };
+
+    if (value.stopReason === 'error') {
+      const detail = typeof value.errorMessage === 'string' && value.errorMessage ? value.errorMessage : 'no detail';
+      return { empty: true, reason: 'error', detail: `the request failed: ${detail}` };
+    }
+
+    const output = typeof value.usage?.output === 'number' ? value.usage.output : 0;
+    if (output > 1) {
+      return {
+        empty: true,
+        reason: 'produced-no-answer',
+        detail: `the model generated ${output} tokens but none of them were an answer`,
+      };
+    }
+
+    if (typeof contextPercent === 'number' && contextPercent >= 87) {
+      return {
+        empty: true,
+        reason: 'context',
+        detail: `the context was ${Math.round(contextPercent)}% full`,
+      };
+    }
+
+    return { empty: true, reason: 'unknown', detail: 'the model returned an empty turn' };
   }
-  return false;
+  return { empty: false };
+}
+
+/** Back-compatible predicate: did the run end without an answer, whatever the cause. */
+export function endedWithoutAnswering(messages: readonly unknown[]): boolean {
+  return describeEmptyEnding(messages).empty;
 }
 
 /**

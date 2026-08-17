@@ -89,7 +89,7 @@ import {
   SentRegistry,
   assistantTextOfMessage,
   blockMatches,
-  endedWithoutAnswering,
+  describeEmptyEnding,
   finalAssistantText,
 } from '../src/forwarding.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
@@ -169,7 +169,22 @@ let lastAssistantText = '';
  * carry the messages and this is the one thing that cannot be inferred from the
  * text alone: "" means both "no answer" and "an answer that was suppressed".
  */
-let lastRunEndedEmpty = false;
+let lastRunEmptyEnding: { empty: boolean; reason?: string; detail?: string } = { empty: false };
+
+/**
+ * How full the context was, for telling an out-of-room empty turn from the other
+ * kinds. Undefined when pi cannot say — right after a compaction, and before the
+ * first response of a session.
+ */
+function contextPercent(): number | null {
+  try {
+    const usage = uiCtx?.getContextUsage() as { percent?: number | null } | undefined;
+    const percent = usage?.percent;
+    return typeof percent === 'number' && Number.isFinite(percent) ? percent : null;
+  } catch {
+    return null;
+  }
+}
 
 /** In-flight permission requests, keyed by the id the sidecar echoes back. */
 const pendingPermissions = new Map<
@@ -676,12 +691,23 @@ async function forwardResult(): Promise<void> {
   // The run ended with the model saying nothing. Nothing was sent — see
   // finalAssistantText — but the operator should know, because from Matrix this
   // looks like a question that was simply ignored.
-  if (lastRunEndedEmpty && [...awaitingReply.values()].some((entry) => entry.live)) {
-    log('the run ended with an empty assistant turn — nothing forwarded, the model produced no answer');
-    notify(
-      'a Matrix message got no answer: the model ended the turn empty, which usually means the context filled up',
-      'warning'
-    );
+  if (lastRunEmptyEnding.empty) {
+    const detail = lastRunEmptyEnding.detail ?? 'the model returned an empty turn';
+    const waiting = [...awaitingReply.entries()].filter(([, entry]) => entry.live);
+    log(`the run ended without an answer (${lastRunEmptyEnding.reason}): ${detail}`);
+    if (waiting.length > 0) {
+      notify(`a Matrix message got no answer — ${detail}`, 'warning');
+      // Silence is the worst outcome for the person waiting: from Matrix it is
+      // indistinguishable from being ignored. Say what happened, without
+      // inventing an answer and without relaying whatever the model was
+      // thinking about beforehand.
+      for (const [room] of waiting) {
+        void callSidecar('reply', {
+          room_id: room,
+          text: `I did not manage to answer that — ${detail}. Ask again, or narrow it down.`,
+        }).catch((err) => log(`could not report the empty turn to ${room}: ${err}`));
+      }
+    }
   }
   const unanswered = [...awaitingReply.values()].filter(
     (entry) => entry.live && !entry.answered
@@ -1499,7 +1525,7 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   pi.on('agent_end', async (event: AgentEndEvent) => {
     const messages = event.messages ?? [];
     lastAssistantText = finalAssistantText(messages);
-    lastRunEndedEmpty = endedWithoutAnswering(messages);
+    lastRunEmptyEnding = describeEmptyEnding(messages, contextPercent());
   });
 
   // At `agent_settled`, not `agent_end`: settled is the point at which no

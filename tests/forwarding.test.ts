@@ -12,6 +12,7 @@ import {
   SentRegistry,
   assistantTextOfMessage,
   blockMatches,
+  describeEmptyEnding,
   endedWithoutAnswering,
   finalAssistantText,
 } from '../src/forwarding.ts';
@@ -269,5 +270,54 @@ describe('an empty final turn is not an answer', () => {
 
   it('is false when there is no assistant message at all', () => {
     expect(endedWithoutAnswering([{ role: 'user', content: [] }])).toBe(false);
+  });
+});
+
+describe('describeEmptyEnding — why the run said nothing', () => {
+  const empty = (extra: Record<string, unknown>) => ({ role: 'assistant', content: [], ...extra });
+
+  it('names a transport failure rather than blaming the context', () => {
+    // Observed: stopReason "error", zero tokens either way, at the very start of
+    // a session. "Stream ended without finish_reason".
+    const out = describeEmptyEnding([
+      empty({ stopReason: 'error', errorMessage: 'Stream ended without finish_reason', usage: { output: 0 } }),
+    ]);
+    expect(out).toEqual({
+      empty: true,
+      reason: 'error',
+      detail: 'the request failed: Stream ended without finish_reason',
+    });
+  });
+
+  it('names a turn that generated tokens but no answer, whatever the room', () => {
+    // Observed: 126 output tokens, content [], stopReason "stop", at 43% of the
+    // window. An earlier version called this "the context filled up", at 43%.
+    const out = describeEmptyEnding([empty({ stopReason: 'stop', usage: { output: 126 } })], 43);
+    expect(out.empty).toBe(true);
+    expect((out as { reason: string }).reason).toBe('produced-no-answer');
+    expect((out as { detail: string }).detail).toContain('126 tokens');
+  });
+
+  it('only blames the context when the context is actually full', () => {
+    const full = describeEmptyEnding([empty({ stopReason: 'stop', usage: { output: 1 } })], 99);
+    expect((full as { reason: string }).reason).toBe('context');
+    expect((full as { detail: string }).detail).toContain('99%');
+
+    const roomy = describeEmptyEnding([empty({ stopReason: 'stop', usage: { output: 1 } })], 43);
+    expect((roomy as { reason: string }).reason).toBe('unknown');
+  });
+
+  it('is false for a run that answered', () => {
+    expect(describeEmptyEnding([assistant([{ type: 'text', text: 'Done.' }])], 99)).toEqual({ empty: false });
+  });
+
+  it('keeps endedWithoutAnswering working for every cause', () => {
+    for (const m of [
+      empty({ stopReason: 'error', usage: { output: 0 } }),
+      empty({ stopReason: 'stop', usage: { output: 126 } }),
+      empty({ stopReason: 'stop', usage: { output: 1 } }),
+    ]) {
+      expect(endedWithoutAnswering([m])).toBe(true);
+    }
   });
 });
