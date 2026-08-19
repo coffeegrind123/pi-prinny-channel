@@ -45,6 +45,12 @@
  *   quit
  *   model    changes what the operator is paying for and how it behaves.
  *   name     harmless, but there is no reason to spend the allowlist on it.
+ *   agents   an interactive TUI menu. Nothing it does can happen over Matrix,
+ *            and it was missing from KNOWN_COMMANDS entirely (AD5, thirteenth
+ *            pass) — so it was neither allowed nor refused but delivered as
+ *            PROSE, spending a model call on text the model cannot act on and
+ *            leaving the sender with an answer about a menu nobody opened.
+ *            Every other command this stack registers was in the table.
  *
  * Anything that is not a recognised pi command is left alone and delivered as
  * ordinary text — "/usr/bin/foo is broken" is a sentence, not an instruction.
@@ -70,6 +76,7 @@ export const KNOWN_COMMANDS: readonly string[] = [
   'tree',
   'trust',
   // this repo's extensions
+  'agents',
   'loop',
   'prinny',
   'stack',
@@ -93,13 +100,44 @@ export const KNOWN_COMMANDS: readonly string[] = [
  * away from the same phone.
  */
 export const MATRIX_ALLOWED: Readonly<Record<string, readonly string[] | null>> = {
-  compact: null,
   stack: null,
   loop: null,
 };
 
 /**
- * Flags that would route around a refusal elsewhere in this table.
+ * Commands this extension performs ITSELF, because pi will not.
+ *
+ * Twelfth pass (AC5), and the reason it is a separate table rather than a third
+ * entry above. `sendUserMessage` reaches `AgentSession.prompt()`, whose command
+ * branch is `_tryExecuteExtensionCommand` — `this._extensionRunner.getCommand(name)`,
+ * i.e. **extension** commands only. In this stack that is `/stack`, `/loop`,
+ * `/agents` and `/prinny`, and nothing else. `/compact` is one of pi's BUILT-IN
+ * slash commands (`core/slash-commands.js`), and the only thing that executes one
+ * is the TUI's own input handler (`modes/interactive/interactive-mode.js`, the
+ * `text === "/compact"` branch). Nothing reachable from here.
+ *
+ * So `/compact` was on the allow-list above, advertised in the Matrix client's
+ * command menu, and could not work: `prompt()` found no extension command, fell
+ * through, and delivered the literal text `/compact` to the model as a user
+ * turn — a whole model call on the one llama slot, spent on a message the model
+ * cannot act on — while the sender was told "Ran `/compact`. Its output stays in
+ * the terminal." The room never went live either (the echoed text is the command,
+ * not the `<channel>` block `markLive` matches), so the answer was never
+ * forwarded and, before AC4, the sweep then reported the message as undelivered.
+ *
+ * `ExtensionContext.compact(options)` exists and is exactly this operation, so
+ * the command is kept and performed properly instead of being withdrawn. The
+ * split is the durable part: an entry here is a promise THIS FILE keeps, an entry
+ * above is a promise pi keeps, and putting a built-in in the wrong table is the
+ * mistake that was made.
+ */
+export const MATRIX_LOCAL: Readonly<Record<string, string>> = {
+  compact: "compact the conversation context",
+};
+
+/**
+ * Flags that would route around a refusal elsewhere in this table, or around
+ * the permission relay.
  *
  * `/loop run --model M` and `/loop prepare --model M` switch the model
  * (`switchModel` in vendor/pi-loop-mode). `/model` is refused from Matrix
@@ -107,12 +145,54 @@ export const MATRIX_ALLOWED: Readonly<Record<string, readonly string[] | null>> 
  * reaching the same switch through a permitted command is a side door, not a
  * feature. Refused on the flag, which is the thing that was actually decided
  * against — not on the subcommand, which is useful.
+ *
+ * ## Thirteenth pass — the two that were missed, and they are not the same kind
+ *
+ * **`--rescue-model` (AD7)** is the same door with a different handle.
+ * `interveneStuck()` calls `switchModel(pi, ctx, state.rescueModel)` at the
+ * third consecutive stuck turn, so the flag switches the operator's session
+ * model exactly as `--model` does — just later, and only if the run gets stuck,
+ * which is a worse property rather than a better one. The `--model` guard could
+ * not catch it: its pattern needs whitespace before the flag, and
+ * `--rescue-model` has `e-` there.
+ *
+ * **`--check` (AD6)** is a different thing altogether, and it is the reason this
+ * table exists. The header above justifies allowing `/loop` in full on the
+ * grounds that "an allowlisted sender can already direct arbitrary work in prose
+ * — bash, edits, anything — **subject only to the permission gate**". That last
+ * clause is what makes the argument work, and `--check` is the one argument on
+ * the allowed surface it is not true of: the value is stored in `LoopState` and
+ * run by `runGoalCheck` as `pi.exec("bash", ["-lc", wrapCheckCommand(cmd)])`,
+ * once per iteration for the life of the run and across `/loop resume`. `pi.exec`
+ * is `execCommand`; it emits no `tool_call`, so this extension's own permission
+ * relay — a `tool_call` handler — never sees it, `rtk-pi`'s gate never sees it,
+ * and `compaction-guard`'s output cap never sees it. The identical string sent
+ * as prose becomes a `bash` tool call and IS gated. One string, two doors, one
+ * of them unwatched.
+ *
+ * A goal check is worth having, so this refuses the flag rather than the
+ * subcommand: `/loop start <goal>` from Matrix still works, and the operator can
+ * attach a check in the terminal, where they are the one choosing the command.
+ *
+ * Measured: `context/testing/probes/q4-what-a-leading-slash-from-matrix-can-do.mjs`.
  */
-export const REFUSED_FLAGS: readonly string[] = ['--model'];
+export const REFUSED_FLAGS: readonly string[] = ['--model', '--rescue-model', '--check'];
+
+/**
+ * Why each refused flag is refused, so the sender is told the actual reason
+ * rather than a sentence about the model that is wrong for two of the three.
+ */
+const REFUSED_FLAG_REASONS: Readonly<Record<string, string>> = {
+  '--model': 'it changes the model for the whole session',
+  '--rescue-model': 'it switches the session model as soon as the run gets stuck',
+  '--check': 'its value is run as a shell command every iteration, and that one does not pass the permission relay',
+};
 
 export type MatrixCommand =
   | { kind: 'text' }
   | { kind: 'run'; name: string; text: string }
+  /** Performed by this extension, not by pi. See MATRIX_LOCAL. */
+  | { kind: 'local'; name: string; text: string }
   | { kind: 'refuse'; name: string; reason: string };
 
 /**
@@ -136,6 +216,12 @@ export function classifyMatrixCommand(body: unknown): MatrixCommand {
 
   if (!KNOWN_COMMANDS.includes(name)) return { kind: 'text' };
 
+  // Before the allow-list, because a local command is not something pi is being
+  // asked to do and the flag check below is about pi's commands.
+  if (Object.prototype.hasOwnProperty.call(MATRIX_LOCAL, name)) {
+    return { kind: 'local', name, text: trimmed };
+  }
+
   if (!Object.prototype.hasOwnProperty.call(MATRIX_ALLOWED, name)) {
     return {
       kind: 'refuse',
@@ -144,14 +230,20 @@ export function classifyMatrixCommand(body: unknown): MatrixCommand {
     };
   }
 
-  const smuggled = REFUSED_FLAGS.find((flag) => new RegExp(`(^|\\s)${flag}(=|\\s|$)`).test(rest));
+  // Longest first, so `--rescue-model` is named as itself rather than being
+  // reported under a flag it merely contains. (The patterns are anchored on
+  // whitespace and cannot actually overlap today; the ordering is here so that
+  // adding `--check-timeout` next to `--check` does not quietly misreport.)
+  const smuggled = [...REFUSED_FLAGS]
+    .sort((a, b) => b.length - a.length)
+    .find((flag) => new RegExp(`(^|\\s)${flag}(=|\\s|$)`).test(rest));
   if (smuggled) {
     return {
       kind: 'refuse',
       name,
       reason:
-        `${smuggled} cannot be set from Matrix — it changes the model for the whole session. ` +
-        `Run /${name} without it, or set the model in the terminal.`,
+        `${smuggled} cannot be set from Matrix — ${REFUSED_FLAG_REASONS[smuggled] ?? 'it is not safe to set from here'}. ` +
+        `Run /${name} without it, or set it in the terminal.`,
     };
   }
 

@@ -273,6 +273,123 @@ describe('an empty final turn is not an answer', () => {
   });
 });
 
+describe("a background subagent's result does not silence an answer that was given", () => {
+  // W1's shape, in this package, decided at the tenth pass.
+  //
+  // pi's agent loop runs another assistant message whenever a steer or a
+  // follow-up arrives mid-run, and `pi-subagents-lite` delivers a finished
+  // BACKGROUND agent exactly that way — as `role: "custom"`, `customType:
+  // "subagent-result"`. Since the forge reasoning patch (2026-08-17) the reply
+  // to it can be reasoning-only, which has no text and no toolCall. So the run's
+  // LAST assistant message says nothing, and the sender was told the model said
+  // nothing — about a turn that had already answered them.
+  const answeredThenNudged = [
+    { role: 'user', content: [{ type: 'text', text: '[matrix] what changed in the parser?' }] },
+    assistant([{ type: 'text', text: 'The tokenizer now handles CRLF; tests pass.' }]),
+    {
+      role: 'custom',
+      customType: 'subagent-result',
+      content: '[Subagent "Explore" a1b2 completed]\n\nsrc/parser.ts imports from src/lex.ts',
+    },
+    assistant([{ type: 'thinking', thinking: 'Nothing further to add to what I already said.' }]),
+  ];
+
+  it('still counts as an answered run', () => {
+    expect(endedWithoutAnswering(answeredThenNudged)).toBe(false);
+  });
+
+  it('forwards the answer, not silence', () => {
+    expect(finalAssistantText(answeredThenNudged)).toBe('The tokenizer now handles CRLF; tests pass.');
+  });
+
+  it('CONTROL — the sender\'s own message still stops the walk', () => {
+    // This is the boundary the 2026-08-17 incident bought, and it is the reason
+    // this was left alone for three passes. Only a `subagent-result` is stepped
+    // over; a `user` message is where an earlier exchange begins.
+    const emptyAfterQuestion = [
+      assistant([{ type: 'text', text: 'A previous answer nobody asked for again.' }]),
+      { role: 'user', content: [{ type: 'text', text: '[matrix] go deeper into the watermarking' }] },
+      assistant([]),
+    ];
+    expect(endedWithoutAnswering(emptyAfterQuestion)).toBe(true);
+    expect(finalAssistantText(emptyAfterQuestion)).toBe('');
+  });
+
+  it('CONTROL — an operator steer is a user message and stops the walk too', () => {
+    const steered = [
+      assistant([{ type: 'text', text: 'Answering the original question.' }]),
+      { role: 'user', content: [{ type: 'text', text: 'actually, do the other thing' }] },
+      assistant([{ type: 'thinking', thinking: 'hmm' }]),
+    ];
+    expect(endedWithoutAnswering(steered)).toBe(true);
+  });
+
+  it('AE7 — the step-over must not carry the walk PAST the sender\'s question', () => {
+    // Fourteenth pass. The two controls above cover a `user` message DIRECTLY
+    // above the empty tail; this is the pair that got past them.
+    //
+    // `describeEmptyEnding` steps over a `subagent-result` and the reply to it —
+    // correctly, that is the case above — and then went on `continue`-ing past
+    // any non-assistant message, `user` included. `finalAssistantText` stops
+    // there (the 2026-08-17 incident is what bought that boundary), so the two
+    // disagreed: this said "there is an answer", that returned "", and the
+    // result was nothing forwarded, no empty ending reported, no continuation
+    // started, and the room retired. The sender got silence and no notice.
+    //
+    // The sequence is one pi produces without contrivance: the operator's own
+    // turn answers, a Matrix message and a settled background subagent are both
+    // drained as follow-ups into the same run, and the model's reply to the pair
+    // is reasoning-only.
+    const crossedTheQuestion = [
+      assistant([{ type: 'text', text: 'Here is the answer to what YOU asked in the terminal.' }]),
+      { role: 'user', content: [{ type: 'text', text: '[matrix] and what about the watermarking?' }] },
+      {
+        role: 'custom',
+        customType: 'subagent-result',
+        content: '[Subagent "Explore" a1b2 completed]\n\nsrc/mark.ts',
+      },
+      assistant([{ type: 'thinking', thinking: 'I should think about that.' }]),
+    ];
+    expect(endedWithoutAnswering(crossedTheQuestion)).toBe(true);
+    expect(finalAssistantText(crossedTheQuestion)).toBe('');
+  });
+
+  it('AE7 CONTROL — the same shape WITHOUT the sender\'s question still answers', () => {
+    // The step-over itself is untouched: when the answer really is in this run,
+    // above the injected pair and with no `user` boundary in between, it is
+    // still found and still forwarded.
+    const answeredThenNudgedAgain = [
+      assistant([{ type: 'text', text: 'The tokenizer now handles CRLF; tests pass.' }]),
+      {
+        role: 'custom',
+        customType: 'subagent-result',
+        content: '[Subagent "Explore" a1b2 completed]\n\nsrc/parser.ts',
+      },
+      assistant([{ type: 'thinking', thinking: 'Nothing further.' }]),
+    ];
+    expect(endedWithoutAnswering(answeredThenNudgedAgain)).toBe(false);
+    expect(finalAssistantText(answeredThenNudgedAgain)).toBe('The tokenizer now handles CRLF; tests pass.');
+  });
+
+  it('AE7 CONTROL — a run with no assistant message at all is unchanged', () => {
+    // `sawEmptyTail` is what keeps the repair narrow: the boundary now stops the
+    // walk in both cases, and only a walk that has already passed an EMPTY
+    // assistant message reports an empty ending.
+    expect(endedWithoutAnswering([{ role: 'user', content: [] }])).toBe(false);
+  });
+
+  it('CONTROL — some other custom message is not stepped over', () => {
+    // Identified by customType, not by "any custom message", so a loop turn or a
+    // context-budget line cannot become invisible by accident.
+    const loopTurn = [
+      assistant([{ type: 'text', text: 'Did a batch.' }]),
+      { role: 'custom', customType: 'loop', content: 'Continue: do one progress batch.' },
+      assistant([{ type: 'thinking', thinking: 'considering' }]),
+    ];
+    expect(endedWithoutAnswering(loopTurn)).toBe(true);
+  });
+});
+
 describe('describeEmptyEnding — why the run said nothing', () => {
   const empty = (extra: Record<string, unknown>) => ({ role: 'assistant', content: [], ...extra });
 

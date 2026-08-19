@@ -92,13 +92,29 @@ import {
   describeEmptyEnding,
   finalAssistantText,
 } from '../src/forwarding.ts';
+import { beginCompaction, compactionInFlight, endCompaction, PRINNY_OWNER } from '../src/compaction-lock.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
+import {
+  COMPACTION_DEFER_LIMIT,
+  planCompaction,
+  standAside,
+  type PendingCompaction,
+} from '../src/compaction-request.ts';
 import {
   giveUpMessage,
   nudgeForEmptyEnding,
   shouldRetryEmptyTurn,
   type EmptyReason,
 } from '../src/continuation.ts';
+import {
+  DELIVERY_GRACE_MS,
+  mergeAwaiting,
+  unansweredMessage,
+  unansweredRooms,
+  undeliveredMessage,
+  undeliveredRooms,
+  type UnansweredReason,
+} from '../src/delivery.ts';
 import { renderInboundMessage, roomOf, type ChannelMessage } from '../src/inbound.ts';
 import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
@@ -131,6 +147,15 @@ const STATUS_KEY = 'prinny';
 
 /** How long to wait for the sidecar to report a Matrix connection before saying so. */
 const CONNECT_REPORT_MS = 60_000;
+
+/**
+ * How often to ask whether pi ever took a message it was handed.
+ *
+ * Half the grace, so a message that was dropped is reported within roughly the
+ * grace period rather than up to twice it. The sweep is arithmetic over a map
+ * that is almost always empty.
+ */
+const DELIVERY_SWEEP_MS = DELIVERY_GRACE_MS / 2;
 
 // ── Module state ─────────────────────────────────────────────────────────────
 // One channel per pi process. A second would be a second Matrix poller on the
@@ -168,6 +193,8 @@ const awaitingReply = new Map<
     emptyRetries?: number;
     /** What was actually asked, so a continuation survives a compaction. */
     question?: string;
+    /** The sender has already been told this one never reached the session — see `sweepUndelivered`. */
+    undeliveredReported?: boolean;
   }
 >();
 /** The assistant's closing text from the last completed run. */
@@ -379,6 +406,13 @@ async function stopChannel(): Promise<void> {
     // channel going away is not consent.
     pending.resolve('deny');
   }
+  // Nothing can be reported to a room once the sidecar is gone, and the sweep's
+  // only action is a reply. Cleared here so a stopped channel does not keep an
+  // interval alive to discover that.
+  if (deliveryTimer) {
+    clearInterval(deliveryTimer);
+    deliveryTimer = undefined;
+  }
   setStatus(undefined);
   if (instance) {
     log('stopping the sidecar');
@@ -446,23 +480,31 @@ function deliverInbound(message: ChannelMessage): void {
 
   lastInbound = { room, messageId: message.meta?.message_id };
 
-  if (room) {
-    awaitingReply.set(room, {
-      messageId: message.meta?.message_id,
-      at: Date.now(),
-      answered: false,
-      injected: text,
-      question: (message.content ?? '').trim(),
-      // Not eligible for forwarding yet — see `markLive`.
-      live: false,
-    });
-  }
-
   // A leading slash is decided here, not by the model. `sendUserMessage` passes
   // `expandPromptTemplates: false`, so a command has never executed from Matrix
   // — it arrived as literal text. Opening that door needs it opened for named
   // commands only; see ../src/command-routing.ts for which and why.
+  //
+  // Classified BEFORE the entry is written, because the entry depends on the
+  // answer — see mergeAwaiting.
   const command = classifyMatrixCommand(message.content ?? '');
+
+  if (room) {
+    awaitingReply.set(
+      room,
+      mergeAwaiting(awaitingReply.get(room), {
+        messageId: message.meta?.message_id,
+        injected: text,
+        question: (message.content ?? '').trim(),
+        handedToPi: command.kind === 'text' || command.kind === 'run',
+        at: Date.now(),
+      }),
+    );
+    // Armed on arrival, not on success: "the send succeeded" is not a thing this
+    // extension can observe (see ../src/delivery.ts), so the sweep has to be
+    // watching before the send rather than because of it.
+    armDeliverySweep();
+  }
 
   if (command.kind === 'refuse' && room) {
     log(`refused /${command.name} from Matrix`);
@@ -476,20 +518,55 @@ function deliverInbound(message: ChannelMessage): void {
     return;
   }
 
+  // A command pi cannot dispatch, done here instead. Twelfth pass (AC5): only
+  // EXTENSION commands reach `_tryExecuteExtensionCommand`, so `/compact` — a pi
+  // built-in, executed by the TUI's own input handler — used to fall through
+  // `prompt()` and be delivered to the model as the literal text "/compact",
+  // costing a model call on the one llama slot while the sender was told it had
+  // run. See MATRIX_LOCAL in ../src/command-routing.ts.
+  if (command.kind === 'local' && room) {
+    runLocalCommand(command.name, room);
+    const pending = awaitingReply.get(room);
+    if (pending) pending.answered = true;
+    return;
+  }
+
   try {
     if (command.kind === 'run') {
       log(`running /${command.name} from Matrix`);
       // The one call in this file that turns Matrix input into harness control.
+      // No cast: `ExtensionAPI.sendUserMessage`'s options really do declare
+      // `{ deliverAs, expandPromptTemplates }` (pi `core/extensions/types.d.ts`,
+      // the ExtensionAPI declaration), and the `as Parameters<…>[1]` that used to
+      // be here asserted the type onto itself — which would have hidden a real
+      // signature change rather than surfacing it.
       api.sendUserMessage(command.text, {
         deliverAs: settings.deliverAs,
         expandPromptTemplates: true,
-      } as Parameters<typeof api.sendUserMessage>[1]);
+      });
       // Command output is rendered in the terminal, not returned as assistant
-      // text, so nothing would otherwise reach the sender. Say what ran.
+      // text, so nothing would otherwise reach the sender. Say what happened.
+      //
+      // Thirteenth pass (AD4): "Ran `X`" is the sentence AC5 objected to, and
+      // AC5 fixed only the command pi cannot dispatch. For the ones it can, this
+      // still cannot know. `sendUserMessage` returns void and pi `.catch`es the
+      // rejection into `emitError`; worse, pi's own `_tryExecuteExtensionCommand`
+      // wraps `command.handler(args, ctx)` in a try/catch that emits the error
+      // and `return true`s — so a command whose handler THREW is reported to
+      // `prompt()` as handled and resolves normally here. And AC4's `answered`
+      // flag, set three lines down, exempts this entry from the undelivered
+      // sweep that AB2 built for exactly this.
+      //
+      // There is no observable to condition on: a dispatched extension command
+      // produces no user message, so `markLive` can never fire for it either.
+      // What can be fixed is the claim. This says what this extension did, which
+      // it knows, instead of what pi did, which it does not.
       if (room) {
         void callSidecar('reply', {
           room_id: room,
-          text: `Ran \`${command.text}\`. Its output stays in the terminal.`,
+          text:
+            `Handed \`${command.text}\` to the session. Its output stays in the terminal — ` +
+            `I cannot see whether it succeeded, so check with the operator if it matters.`,
         }).catch(() => undefined);
         const pending = awaitingReply.get(room);
         if (pending) pending.answered = true;
@@ -502,13 +579,155 @@ function deliverInbound(message: ChannelMessage): void {
     // is the whole point.
     api.sendUserMessage(text, { deliverAs: settings.deliverAs });
   } catch (err) {
+    // This catch sees ONE failure: `runtime.assertActive()` throwing on a stale
+    // extension runtime, which is synchronous. Everything else — `prompt()`
+    // refusing during a compaction (`agent-session.js:805`), no model, no
+    // provider auth — rejects a promise pi itself `.catch`es into `emitError`,
+    // and `emitError` has no listener outside a TUI. There is no error event an
+    // extension can subscribe to either. `sweepUndelivered` is the half of this
+    // handler that can actually see those; see ../src/delivery.ts.
     log(`could not deliver an inbound message into the session: ${err}`);
     notify('a Matrix message could not be delivered into this session — see the log', 'error');
   }
 }
 
+/**
+ * Perform a command pi will not, and tell the room what happened.
+ *
+ * One entry today: `/compact`. `ExtensionContext.compact(options)` triggers the
+ * compaction without awaiting it and reports through callbacks, so the reply is
+ * sent from `onComplete`/`onError` rather than guessed at — a sender who asked
+ * for a compaction because the bot had gone slow is exactly the person who
+ * should not be told "done" before it is.
+ *
+ * `uiCtx` is the session's own `ExtensionContext`, captured at `session_start`
+ * and refreshed on every `agent_start`. Absent means no session has opened yet,
+ * which is worth saying rather than silently doing nothing.
+ */
+function runLocalCommand(name: string, room: string): void {
+  const reply = (text: string) =>
+    void callSidecar('reply', { room_id: room, text }).catch((err) =>
+      log(`could not reply to ${room} after /${name}: ${err}`)
+    );
+
+  if (name !== 'compact') {
+    // Unreachable while MATRIX_LOCAL has one entry; stated so that adding a
+    // second one without a branch fails loudly rather than silently.
+    log(`no local handler for /${name}`);
+    reply(`/${name} is not available from Matrix. Run it in the terminal.`);
+    return;
+  }
+
+  // Thirteenth pass (AD3): a compaction CANCELS the turn in flight, so it waits.
+  // The rule is in ../src/compaction-request.ts, with the whole account; the two
+  // facts it needs are here.
+  const plan = planCompaction({ hasSession: Boolean(uiCtx), agentRunning });
+  if (plan.action === 'unavailable') {
+    log('cannot compact: no session context yet');
+    reply(plan.reply);
+    return;
+  }
+  if (plan.action === 'defer') {
+    pendingCompaction = { room, at: Date.now() };
+    log('compaction requested from Matrix while the session is mid-turn — deferred to agent_settled');
+    notify('a Matrix /compact is waiting for this turn to finish', 'info');
+    reply(plan.reply);
+    return;
+  }
+
+  startCompaction(room);
+}
+
+/**
+ * A `/compact` asked for while pi was busy, waiting for the turn to end.
+ *
+ * One slot, last-write-wins: two senders asking during the same turn want one
+ * compaction, and the second is the one whose room is still expecting an answer
+ * soonest. Cleared before the compaction starts so a failure cannot latch it on.
+ */
+let pendingCompaction: PendingCompaction | undefined;
+
+/** Start a compaction now and answer the room from the callbacks, not from the call. */
+function startCompaction(room: string): void {
+  const reply = (text: string) =>
+    void callSidecar('reply', { room_id: room, text }).catch((err) =>
+      log(`could not reply to ${room} after /compact: ${err}`)
+    );
+
+  if (!uiCtx) {
+    log('cannot compact: no session context');
+    reply('I cannot compact — no session is open.');
+    return;
+  }
+
+  // Fifteenth pass (§11.12, closed): another extension may already be compacting
+  // this session. `vendor/pi-loop-mode`'s `agent_settled` handler runs BEFORE
+  // this one and may have asked for an emergency compaction on the very same
+  // settlement — and pi's `compact()` does not refuse a second call: it aborts,
+  // overwrites `_compactionAbortController` and proceeds, so the second request
+  // cancels the first one's work and makes `prompt()` throw for anything in
+  // between.
+  //
+  // The sender asked for the context to be compacted, and it IS being compacted.
+  // So this says so rather than asking again: it is the honest answer, and it is
+  // the one that does not abort somebody else's summariser. The lock is not a
+  // queue — a second compaction moments after the first only earns pi's own
+  // "Already compacted".
+  const holder = compactionInFlight();
+  if (holder) {
+    log(`a compaction is already running (${holder.owner}); not asking for a second one`);
+    reply('A compaction is already running — I will let that one finish rather than cutting it off.');
+    return;
+  }
+
+  log('compacting the context, asked from Matrix');
+  notify('compacting the context (asked from Matrix)', 'info');
+  beginCompaction(PRINNY_OWNER);
+  try {
+    uiCtx.compact({
+      onComplete: () => {
+        endCompaction(PRINNY_OWNER);
+        log('compaction finished');
+        reply('Compacted the conversation context.');
+      },
+      onError: (error: Error) => {
+        endCompaction(PRINNY_OWNER);
+        log(`compaction failed: ${error.message}`);
+        reply(`I could not compact the context: ${error.message}`);
+      },
+    });
+  } catch (err) {
+    // `compact` asserts the runtime is active, which throws synchronously on a
+    // stale one — the same single failure `sendUserMessage`'s catch can see.
+    endCompaction(PRINNY_OWNER);
+    log(`could not start a compaction: ${err}`);
+    reply('I could not start a compaction just then; please try again.');
+  }
+}
+
+/**
+ * Run a deferred `/compact`, if one is waiting. Called from `agent_settled`,
+ * after the answer has been forwarded — a compaction that ran first would abort
+ * nothing (the run is over) but would race the forward for the same slot.
+ */
+function drainPendingCompaction(): void {
+  const pending = pendingCompaction;
+  if (!pending) return;
+  pendingCompaction = undefined;
+  startCompaction(pending.room);
+}
+
 /** Text already delivered to Matrix during this run. */
 const alreadySent = new SentRegistry();
+
+/**
+ * This run produced an answer that could not be attributed to one room.
+ *
+ * Set by `forwardToMatrix` when it refuses to guess between two live rooms, read
+ * by `forwardResult` when it decides what to tell the rooms it is about to
+ * retire, and cleared with `alreadySent` at the end of the run. See AF1.
+ */
+let unattributableThisRun = false;
 
 /**
  * A room becomes eligible for forwarding only once pi has actually taken its
@@ -565,6 +784,12 @@ async function forwardToMatrix(text: string, why: string): Promise<void> {
       `forward skipped (${why}): ${rooms.length} rooms are waiting and this text cannot be ` +
         `attributed to one of them (${rooms.join(', ')})`
     );
+    // Fifteenth pass (AF1): remembered, because the refusal above is right and
+    // `forwardResult` is about to retire every one of these rooms. Without this
+    // the answer is refused, the evidence is deleted, and two people are left
+    // with silence that nothing in the stack can still account for. Cleared with
+    // `alreadySent`, at the end of the run this belongs to.
+    unattributableThisRun = true;
     return;
   }
 
@@ -695,7 +920,14 @@ function stopTyping(): void {
   applyTyping(planStopAll(typingRooms));
 }
 
-async function forwardResult(): Promise<void> {
+/**
+ * Send the run's answer, and continue the run if it produced none.
+ *
+ * Returns whether a CONTINUATION was started, because `agent_settled` has one
+ * more thing to do afterwards and it is a compaction — which begins by aborting
+ * the session. See standAside in ../src/compaction-request.ts (AE2).
+ */
+async function forwardResult(): Promise<boolean> {
   if (settings.forward === 'result' && lastAssistantText) {
     await forwardToMatrix(lastAssistantText, 'turn result');
   }
@@ -705,13 +937,63 @@ async function forwardResult(): Promise<void> {
   // A run that ended without an answer is continued rather than abandoned, so a
   // Matrix question cannot simply never complete. Bounded: see ../src/continuation.ts.
   let retrying = false;
+  /**
+   * The continuation could not be sent because a compaction is already running.
+   *
+   * Fifteenth pass built the lock; sixteenth (AG3) is the second sender in this
+   * package that has to read it. `startCompaction` twelve lines up does; this
+   * one did not — and it is the one that runs on the `agent_settled` the LOOP has
+   * just requested an emergency compaction on, because `pi-loop-mode`'s handler
+   * runs first.
+   *
+   * Kept apart from `retrying`, which is returned as `continuationStarted` and
+   * decides whether a waiting `/compact` stands aside (AE2). Nothing started, so
+   * nothing should stand aside for it.
+   */
+  let heldForCompaction = false;
   if (lastRunEmptyEnding.empty) {
     const detail = lastRunEmptyEnding.detail ?? 'the model returned an empty turn';
     const reason = (lastRunEmptyEnding.reason ?? 'unknown') as EmptyReason;
     const waiting = [...awaitingReply.entries()].filter(([, entry]) => entry.live);
     log(`the run ended without an answer (${reason}): ${detail}`);
 
-    if (waiting.length > 0) {
+    // Fifteenth pass's lock, read by its second caller in this file (AG3).
+    //
+    // pi's refusal — "Cannot submit a prompt while compaction is in progress" —
+    // lives on `AgentSession.prompt()`, which `sendUserMessage` reaches, and it
+    // is a THROW into a promise pi `.catch`es into `emitError`, whose listener
+    // set is empty outside a TUI. So the nudge below would go nowhere, silently,
+    // while `entry.emptyRetries` was charged for it and one of the two attempts
+    // this message gets was spent on a send that never happened.
+    //
+    // The two conditions are correlated rather than independent, which is what
+    // makes this the ordinary case rather than a race: the loop's starvation
+    // rung fires on a clean "stop" with no answer at >= 80% of the window, and
+    // `describeEmptyEnding`'s `context` reason is >= 87%. ONE empty turn on a
+    // saturated context produces both, and that is exactly the moment a Matrix
+    // sender is waiting through.
+    //
+    // The room is retired with the sentence below rather than left live: an
+    // entry that is live and unanswered is invisible to `undeliveredRooms`, so
+    // leaving it would trade a wasted retry for silence. The sender is told
+    // NOW, and told the true reason, instead of being told a minute later by the
+    // sweep that it "may have been compacting".
+    //
+    // Measured in
+    // `context/testing/probes/t1-the-nudge-and-the-compaction-already-running.mjs`.
+    const compactionHolder = waiting.length > 0 ? compactionInFlight() : undefined;
+    if (compactionHolder) {
+      heldForCompaction = true;
+      log(
+        `not continuing the run: ${compactionHolder.owner} is compacting, and pi refuses a prompt while it is`,
+      );
+      notify(
+        `no answer, and ${compactionHolder.owner} is compacting — the sender is being told to ask again`,
+        'warning',
+      );
+    }
+
+    if (waiting.length > 0 && !heldForCompaction) {
       const canRetry = waiting.every(([, entry]) => shouldRetryEmptyTurn(entry.emptyRetries ?? 0));
       if (canRetry && api) {
         retrying = true;
@@ -720,10 +1002,43 @@ async function forwardResult(): Promise<void> {
         log(`continuing the run to get an answer (attempt ${attempt})`);
         notify(`no answer yet — asking the model again (${detail})`, 'info');
         try {
-          // A follow-up, not a steer: nothing is in flight at agent_settled, and
-          // this must read as the next thing to do rather than an interruption.
+          // A follow-up, not a steer: this must read as the next thing to do
+          // rather than an interruption. (It is no longer true that nothing is in
+          // flight at `agent_settled` — see AE2 and the `standAside` call below.)
           const question = waiting.map(([, entry]) => entry.question).find(Boolean);
-          api.sendUserMessage(nudgeForEmptyEnding(reason, question), { deliverAs: 'followUp' });
+          const nudge = nudgeForEmptyEnding(reason, question);
+          // Fourteenth pass (AE4): the room waits for EVIDENCE that pi took the
+          // nudge, exactly as it waited for evidence that pi took the original
+          // message.
+          //
+          // `retrying` is a claim about a CALL. `api.sendUserMessage` returns
+          // void, and pi's binding is
+          // `this.sendUserMessage(...).catch(err => runner.emitError(...))`,
+          // whose listener set is empty outside a TUI — so `prompt()` refusing
+          // during a compaction, no model, or a dead provider all look exactly
+          // like success from here, and the `catch` below only ever sees a
+          // synchronous stale-runtime throw. `retrying` is nonetheless what
+          // suppresses the retirement of every live room at the bottom of this
+          // function, so a continuation that never happened left the sender's
+          // room LIVE and unanswered — and the next unrelated turn's answer was
+          // forwarded to it. That is the leak `markLive` exists to prevent,
+          // reached from the other side; measured in probe `r3`, mode
+          // `never-taken`.
+          //
+          // Standing the room back down until `markLive` fires for the nudge
+          // fixes it with the mechanism that is already there, and it fixes the
+          // silence too: a nudge pi never takes leaves an entry that is not
+          // live, not answered and past the grace on an idle session, which is
+          // precisely what `sweepUndelivered` reports — with the one sentence
+          // that is right ("I could not hand that to the session … please send
+          // it again").
+          for (const [, entry] of waiting) {
+            entry.live = false;
+            entry.injected = nudge;
+            entry.at = Date.now();
+            entry.undeliveredReported = false;
+          }
+          api.sendUserMessage(nudge, { deliverAs: 'followUp' });
         } catch (err) {
           log(`could not continue the run: ${err}`);
           retrying = false;
@@ -736,6 +1051,7 @@ async function forwardResult(): Promise<void> {
         // indistinguishable from being ignored. Say what happened, without
         // inventing an answer and without relaying whatever the model was
         // thinking about beforehand.
+        for (const [, entry] of waiting) entry.answered = true;
         for (const [room] of waiting) {
           void callSidecar('reply', { room_id: room, text: giveUpMessage(detail) }).catch((err) =>
             log(`could not report the empty turn to ${room}: ${err}`)
@@ -744,15 +1060,11 @@ async function forwardResult(): Promise<void> {
       }
     }
   }
-  const unanswered = [...awaitingReply.values()].filter(
-    (entry) => entry.live && !entry.answered
-  );
-  if (unanswered.length > 0 && settings.forward === 'off') {
-    log(
-      `${unanswered.length} Matrix message(s) went unanswered and forward is "off" — ` +
-        'the model did not call the prinny tool'
-    );
-    notify('a Matrix message went unanswered — forwarding is off', 'warning');
+  if (settings.forward === 'off' && unansweredRooms(awaitingReply.entries()).length > 0) {
+    // The cause, named, for the log. The operator's notice and the SENDER's
+    // sentence are both below, where the rooms are retired — one place, so a
+    // room cannot be told twice or not at all. See AF1.
+    log('a Matrix message went unanswered and forward is "off" — the model did not call the prinny tool');
   }
 
   // Only rooms pi has actually read are retired. One whose message is still
@@ -763,14 +1075,115 @@ async function forwardResult(): Promise<void> {
   // to produce the answer it is owed, and retiring it now would send that answer
   // nowhere.
   if (!retrying) {
+    // Fifteenth pass (AF1): a room being retired with nothing sent for it is
+    // told so, BEFORE the entry that proves it goes.
+    //
+    // The case this is for is the one `forwardToMatrix` refuses on purpose: two
+    // rooms live at once, no way to attribute the answer, so nothing is sent.
+    // The refusal is right — sending one person's conversation to another is
+    // not undoable — and until now the retirement below then deleted the only
+    // record that either question had ever been asked. Two people, two
+    // questions, zero answers, one line in a log file, and `sweepUndelivered`
+    // structurally unable to see it because the entries were gone.
+    //
+    // The generic branch covers everything else that ends the same way: a turn
+    // whose text this channel had nothing to forward from, and `forward: "off"`
+    // with a model that never called the tool. Both were silent too.
+    const unanswered = unansweredRooms(awaitingReply.entries());
+    if (unanswered.length > 0) {
+      // AG3 shares AF1's retirement notice rather than inventing a second one:
+      // the room really is being retired with nothing sent, and the only thing
+      // that differs is WHY. `heldForCompaction` is checked after
+      // `unattributableThisRun`, because two live rooms is the more specific
+      // fact — that one is about which answer, this one about whether there was
+      // one to give.
+      const reason: UnansweredReason = unattributableThisRun
+        ? 'ambiguous'
+        : heldForCompaction
+          ? 'compacting'
+          : 'nothing-to-send';
+      notify(
+        reason === 'ambiguous'
+          ? `an answer could not be attributed to one of ${unanswered.length} waiting rooms — ` +
+              'each has been told, and nothing was forwarded'
+          : reason === 'compacting'
+            ? `${unanswered.length} Matrix message(s) got no answer and could not be re-asked — a compaction was running`
+            : `${unanswered.length} Matrix message(s) ended the turn with nothing to send`,
+        'warning',
+      );
+      for (const room of unanswered) {
+        const entry = awaitingReply.get(room);
+        if (entry) entry.answered = true;
+        void callSidecar('reply', { room_id: room, text: unansweredMessage(reason) }).catch((err) =>
+          log(`could not tell ${room} that nothing was sent: ${err}`)
+        );
+      }
+    }
     for (const [room, entry] of awaitingReply) {
       if (entry.live) awaitingReply.delete(room);
     }
   }
   alreadySent.clear();
+  unattributableThisRun = false;
   // After the retirement above, so it reconciles against the state that is left
   // rather than the one that just ended.
   stopTyping();
+  sweepUndelivered();
+  return retrying;
+}
+
+/**
+ * Tell anyone whose message pi never took that it never took it.
+ *
+ * `api.sendUserMessage` cannot fail in a way this extension can see: it returns
+ * `void`, and pi's binding `.catch`es the rejection into `emitError`, whose
+ * listener set is empty outside a TUI. The `try`/`catch` around the call catches
+ * only a synchronous stale-runtime throw. So the evidence has to be the absence
+ * of `markLive` — see `../src/delivery.ts`, which holds the rule and the reasons.
+ *
+ * Run from two places, both of which are "the moment the answer should have
+ * existed": the end of every run, and a slow timer for the case where no run ever
+ * started, which is the failure itself.
+ */
+function sweepUndelivered(): void {
+  const rooms = undeliveredRooms(awaitingReply.entries(), Date.now(), agentRunning);
+  if (rooms.length === 0) {
+    if (deliveryTimer && ![...awaitingReply.values()].some((entry) => !entry.live)) {
+      clearInterval(deliveryTimer);
+      deliveryTimer = undefined;
+    }
+    return;
+  }
+
+  for (const room of rooms) {
+    const entry = awaitingReply.get(room);
+    if (!entry) continue;
+    // Marked before the send, so a sidecar that is also down cannot turn this
+    // into a message every sweep.
+    entry.undeliveredReported = true;
+    log(`pi never took the message from ${room} — reporting it as undelivered`);
+    notify('a Matrix message could not be delivered into this session — see the log', 'warning');
+    void callSidecar('reply', { room_id: room, text: undeliveredMessage() }).catch((err) =>
+      log(`could not report the undelivered message to ${room}: ${err}`)
+    );
+  }
+}
+
+/**
+ * The slow sweep, armed only while something is waiting to be consumed.
+ *
+ * An interval rather than a timer per message: the verdict depends on the
+ * session being idle, which is not knowable at delivery time, and one unref'd
+ * interval that stops itself is cheaper to reason about than N pending timers
+ * that have to be cancelled on every path a message can leave by.
+ */
+let deliveryTimer: ReturnType<typeof setInterval> | undefined;
+
+function armDeliverySweep(): void {
+  if (deliveryTimer) return;
+  deliveryTimer = setInterval(sweepUndelivered, DELIVERY_SWEEP_MS);
+  // Never hold the process open to complain about a message.
+  (deliveryTimer as unknown as { unref?: () => void }).unref?.();
 }
 
 // ── Permission relay ─────────────────────────────────────────────────────────
@@ -1579,7 +1992,27 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
     // finished reply reads as though more is coming.
     agentRunning = false;
     stopTyping();
-    await forwardResult();
+    const continuationStarted = await forwardResult();
+    // Thirteenth pass (AD3): a `/compact` that arrived mid-turn runs here, where
+    // aborting costs nothing because the run is already over. After the forward,
+    // so the answer the sender is waiting for is not queued behind a summariser
+    // call on the one llama slot.
+    //
+    // Fourteenth pass (AE2): …unless the line above just STARTED a run. AD3's
+    // premise is about the run that ended, and `forwardResult` is where the
+    // empty-turn continuation is sent from. Bounded, so a continuation that
+    // never materialises cannot starve the request the sender is waiting on —
+    // the rule and the bound are in ../src/compaction-request.ts.
+    const held = standAside(pendingCompaction, continuationStarted);
+    if (held.wait) {
+      pendingCompaction = held.pending;
+      log(
+        `a Matrix /compact is standing aside for a continuation ` +
+          `(${held.pending.stoodAside}/${COMPACTION_DEFER_LIMIT})`
+      );
+    } else {
+      drainPendingCompaction();
+    }
   });
 
   pi.on('tool_call', async (event: ToolCallEvent, ctx) => {

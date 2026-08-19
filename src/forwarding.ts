@@ -81,10 +81,55 @@ export function describeEmptyEnding(
   messages: readonly unknown[],
   contextPercent?: number | null
 ): EmptyEnding {
+  // Fourteenth pass (AE7): whether the walk has already passed an assistant
+  // message with nothing in it. It decides what a `user` boundary means — see
+  // the `break` below — and nothing else.
+  let sawEmptyTail = false;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const value = messages[index] as
       | { role?: unknown; content?: unknown; stopReason?: unknown; usage?: { output?: unknown }; errorMessage?: unknown }
       | undefined;
+    // Forge fork (W1's shape, decided): a trailing assistant message that pi ran
+    // because a BACKGROUND SUBAGENT's result was injected mid-turn is not the
+    // model declining to answer the sender.
+    //
+    // pi's agent loop runs another assistant message whenever a steer or a
+    // follow-up arrives, and `pi-subagents-lite` delivers a finished background
+    // agent exactly that way — as a `role: "custom"`, `customType:
+    // "subagent-result"` message. Since 2026-08-17 the reply to it can be
+    // reasoning-only, which has no text and no toolCall, so this read
+    // `produced-no-answer` for a turn that had already answered, and the sender
+    // was told the model said nothing.
+    //
+    // Walking past it is safe in a way that walking past a general empty tail is
+    // NOT — and the difference is the whole reason this was left alone for three
+    // passes. The incident in `finalAssistantText`'s header is a run whose OWN
+    // final turn was empty, where walking back crossed the sender's own `user`
+    // message and delivered the PREVIOUS turn's deliberation to Matrix. That
+    // boundary is still respected: the pair is stepped over only when the empty
+    // message is immediately preceded by a `subagent-result`, and a `user`
+    // message — the sender's question, or an operator steer that changed the
+    // subject — is never crossed. Nothing that could resurrect the incident is.
+    if (isBackgroundSubagentResult(value)) continue;
+    // Fourteenth pass (AE7): the sender's own question ends the walk, exactly as
+    // it ends `finalAssistantText`'s.
+    //
+    // This used to `continue` past a `user` message like any other non-assistant
+    // one, so the walk could leave the run's own tail and find an answer from
+    // BEFORE the message being answered — and report `empty: false` for a run
+    // that had answered nobody. `finalAssistantText` stops here (that boundary is
+    // what the incident in its header bought), so the pair disagreed: this said
+    // "there is an answer", that returned "", and the result was a sender whose
+    // question was retired with no answer, no continuation and no notice.
+    //
+    // Reachable through the pair this function already steps over: a run whose
+    // tail is `… assistant(answer) · user(the matrix question) · custom
+    // subagent-result · assistant(reasoning-only)` skips the last two and lands
+    // on the `user` message. The question was not answered, and `empty: true` is
+    // the honest reading — it is also the safe direction, because
+    // `finalAssistantText` returns "" either way and the only thing that changes
+    // is whether the sender gets a continuation instead of silence.
+    if (value?.role === 'user') break;
     if (!value || value.role !== 'assistant') continue;
 
     const content = value.content;
@@ -107,6 +152,12 @@ export function describeEmptyEnding(
             return type === 'text' || type === 'toolCall';
           });
     if (!isEmpty) return { empty: false };
+    sawEmptyTail = true;
+
+    // Empty — but is it the model declining to answer the sender, or the reply
+    // to a background subagent's result that pi injected after the answer? Only
+    // the message directly above decides, and only a `subagent-result` counts.
+    if (isBackgroundSubagentResult(messages[index - 1])) continue;
 
     // `length` means the backend hit the token cap mid-output. This only became
     // distinguishable once patches/forge_reasoning_passthrough.py stopped forge
@@ -145,7 +196,25 @@ export function describeEmptyEnding(
 
     return { empty: true, reason: 'unknown', detail: 'the model returned an empty turn' };
   }
-  return { empty: false };
+  // Fourteenth pass (AE7). The walk ended at the sender's own `user` message, or
+  // ran off the start of the run, having stepped over an empty tail and one or
+  // more injected `subagent-result` pairs. The run answered nobody.
+  //
+  // Before this, the `user` message was `continue`d past like any other
+  // non-assistant one, so the walk could leave the run's own tail and find an
+  // answer from BEFORE the message being answered — and report `empty: false`
+  // for a run that had answered nobody. `finalAssistantText` stops at that
+  // boundary (the incident in its header is what bought it), returns "", and the
+  // two then disagreed silently: no text was forwarded, no empty ending was
+  // reported, no continuation was started, and the room was retired. The sender
+  // got nothing and was told nothing.
+  //
+  // `sawEmptyTail` is what keeps this narrow: a run with no assistant message at
+  // all is still `empty: false`, which is what it has always been and what the
+  // suite pins.
+  return sawEmptyTail
+    ? { empty: true, reason: 'unknown', detail: 'the run produced no answer after the message it was given' }
+    : { empty: false };
 }
 
 /** Back-compatible predicate: did the run end without an answer, whatever the cause. */
@@ -173,10 +242,36 @@ export function endedWithoutAnswering(messages: readonly unknown[]): boolean {
 export function finalAssistantText(messages: readonly unknown[]): string {
   if (endedWithoutAnswering(messages)) return '';
   for (let index = messages.length - 1; index >= 0; index -= 1) {
+    // Stop where `describeEmptyEnding` stops. Its walk now steps over an
+    // injected `subagent-result` and the reasoning-only reply to it, so this one
+    // has to reach the same message — otherwise the pair disagree about which
+    // run answered, and the disagreement is silent.
+    //
+    // A `user` message still ends the search: that is the sender's own question,
+    // and anything above it belongs to an earlier exchange. The empty-final-turn
+    // guard above is what the incident in this header bought, and it is
+    // unchanged.
+    const value = messages[index] as { role?: unknown } | undefined;
+    if (value?.role === 'user') break;
     const text = assistantTextOfMessage(messages[index]);
     if (text) return text;
   }
   return '';
+}
+
+/**
+ * A background subagent's result, injected into a run that was already going.
+ *
+ * `pi-subagents-lite`'s `SpawnCoordinator.emitIndividualNudge` sends it with
+ * `pi.sendMessage({customType: "subagent-result", …})`, which pi turns into a
+ * `role: "custom"` message. It is the one injected message this package needs to
+ * step over, and it is identified by that customType rather than by "any custom
+ * message" so that nothing else — a loop turn, a context-budget line — is
+ * silently treated as invisible.
+ */
+function isBackgroundSubagentResult(value: unknown): boolean {
+  const message = value as { role?: unknown; customType?: unknown } | null | undefined;
+  return message?.role === 'custom' && message?.customType === 'subagent-result';
 }
 
 /**
