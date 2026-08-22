@@ -321,21 +321,27 @@ export class McpChild {
       return;
     }
 
-    const id = message.id;
-    if (typeof id === 'number') {
-      const pending = this.pending.get(id);
-      if (!pending) return; // Reply to a request we already timed out.
-      this.pending.delete(id);
-      clearTimeout(pending.timer);
-      if (message.error) {
-        const error = message.error as JsonRpcError;
-        pending.reject(new Error(`${pending.method}: ${error?.message ?? 'unknown error'}`));
-      } else {
-        pending.resolve(message.result);
-      }
-      return;
-    }
-
+    // `method` FIRST, and the order is the whole of the fix.
+    //
+    // Forge fork, twentieth pass (AK3). This used to branch on
+    // `typeof id === 'number'` before looking at `method`, and JSON-RPC gives a
+    // server-initiated REQUEST both: `{jsonrpc, id, method, params}`. So such a
+    // request was read as a REPLY — `pending.resolve(message.result)` with
+    // `message.result` undefined, i.e. the client's own outstanding call
+    // resolved with nothing and no error. `nextId` starts at 1 and `initialize`
+    // is the first thing sent, so the first server request would have resolved
+    // the handshake: `start()` would have returned, `initialized` would be true,
+    // and the channel would read as up while the sidecar had never answered.
+    //
+    // The "method not found" reply below was written for exactly this case —
+    // its own comment says "a server-initiated *request* (has an id)" — and it
+    // could not be reached with a numeric id, which is the only kind any MCP
+    // implementation sends. The guard existed and the path to it did not.
+    //
+    // Latent rather than live: this stack's sidecar only ever calls
+    // `mcp.notification(...)`, which carries no id. It stops being latent the
+    // day the MCP SDK sends a `ping`, `roots/list` or `sampling/createMessage`
+    // — all of them requests, all of them id'd, none of them ours to answer.
     if (typeof message.method === 'string') {
       const params = (message.params ?? {}) as Record<string, unknown>;
       // A server-initiated *request* (has an id) is not something this client
@@ -354,6 +360,22 @@ export class McpChild {
       } catch (err) {
         this.options.onStderr(`notification handler threw: ${err}\n`);
       }
+      return;
+    }
+
+    const id = message.id;
+    if (typeof id === 'number') {
+      const pending = this.pending.get(id);
+      if (!pending) return; // Reply to a request we already timed out.
+      this.pending.delete(id);
+      clearTimeout(pending.timer);
+      if (message.error) {
+        const error = message.error as JsonRpcError;
+        pending.reject(new Error(`${pending.method}: ${error?.message ?? 'unknown error'}`));
+      } else {
+        pending.resolve(message.result);
+      }
+      return;
     }
   }
 

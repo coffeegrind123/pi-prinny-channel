@@ -186,15 +186,80 @@ export function undeliveredRooms<T extends DeliveryEntry>(
   if (agentRunning) return [];
   const rooms: string[] = [];
   for (const [room, entry] of entries) {
-    // `answered` first, because it is the question that makes the others
-    // meaningful: an entry this extension resolved itself was never handed to
-    // pi, so pi not having taken it is not evidence of anything. See AC4 on
-    // DeliveryEntry.answered.
-    if (entry.answered || entry.live || entry.undeliveredReported) continue;
+    if (!awaitsVerdict(entry)) continue;
     if (now - entry.at < graceMs) continue;
     rooms.push(room);
   }
   return rooms;
+}
+
+/**
+ * Can this entry ever produce a report?
+ *
+ * `answered` is first because it is the question that makes the others
+ * meaningful: an entry this extension resolved itself was never handed to pi, so
+ * pi not having taken it is not evidence of anything. See AC4 on
+ * {@link DeliveryEntry.answered}.
+ *
+ * Split out in the twenty-first pass (AL4) so that the sweep's two readers ask
+ * the SAME question. See {@link sweepHasWork}.
+ */
+function awaitsVerdict(entry: DeliveryEntry): boolean {
+  return !entry.answered && !entry.live && !entry.undeliveredReported;
+}
+
+/**
+ * Is there anything left for the sweep to do — now or after the grace elapses?
+ *
+ * ## Why this exists
+ *
+ * Forge fork, twenty-first pass (AL4). `armDeliverySweep` starts a 30 s interval
+ * on the arrival of any inbound message. Stopping it was the sweep's own job,
+ * and the test it used was not the test that armed it:
+ *
+ * ```
+ *   arm     a message arrived                       (every arrival, no exceptions)
+ *   disarm  nothing is reportable right now
+ *           AND no entry has `live === false`       ← a DIFFERENT, weaker question
+ * ```
+ *
+ * Nothing retires a dead entry. `forwardResult` deletes only the LIVE ones —
+ * *"if (entry.live) awaitingReply.delete(room)"* — and the sweep deliberately
+ * leaves a reported entry in place so that a late `markLive` can still deliver
+ * the answer. So the moment the sweep reported one message, that entry sat in
+ * the map with `live: false` and `undeliveredReported: true` forever: the first
+ * half of the disarm test passed (it is reported, so it is not reportable
+ * again), the second half could never pass again, and the interval woke every
+ * thirty seconds for the life of the session to look at an entry it had already
+ * finished with.
+ *
+ * The cheaper reproduction does not even need a failure. A Matrix `/loop status`
+ * is a `local`/`run` command: it arms the sweep on arrival and is marked
+ * `answered`, which is also `live: false` forever. One such command is enough.
+ *
+ * The interval is `unref`'d, so this never held the process open — it is a wake
+ * a second, roughly, over a session's lifetime, plus a map that only grows. What
+ * makes it worth fixing is the shape rather than the cost: **an ending whose
+ * condition can no longer be reached is not an ending.**
+ *
+ * ## Why it is the arm test, exactly
+ *
+ * The sweep's work is `undeliveredRooms`, and this is that function with the
+ * clock removed. An entry inside its grace is not reportable *yet* and must keep
+ * the timer; one that is answered, live or already reported can never be
+ * reportable again and holds nothing. Writing it as `awaitsVerdict` shared
+ * between the two is the point: they cannot drift, because there is one
+ * predicate.
+ *
+ * `agentRunning` is deliberately NOT a parameter. A running agent suppresses the
+ * verdict, not the work — disarming while a run is in flight would leave the
+ * arrival that armed it with nothing watching once the run ends.
+ */
+export function sweepHasWork<T extends DeliveryEntry>(entries: Iterable<[string, T]>): boolean {
+  for (const [, entry] of entries) {
+    if (awaitsVerdict(entry)) return true;
+  }
+  return false;
 }
 
 /**

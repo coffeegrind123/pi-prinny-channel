@@ -2,9 +2,13 @@
  * The permission gate, and its agreement with the sidecar's reply parser.
  */
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it, loadServerModule } from './harness.ts';
 import {
+  APPROVED_COMMAND_KEY,
   describeCall,
+  markApproved,
   needsApproval,
   newRequestId,
   previewCall,
@@ -155,5 +159,201 @@ describe('request ids', () => {
       expect(parsed).toMatchObject({ requestId: id, behavior: 'allow' });
       expect(PERMISSION_CALLBACK_RE.test(`perm:allow:${id}`)).toBe(true);
     }
+  });
+});
+
+/**
+ * AJ3 (nineteenth pass) — the command a person approved, and the one that ran.
+ *
+ * `tool_call` handlers run in load order over ONE mutable `event.input`, and
+ * `scripts/pi-local.sh` loads this package before `vendor/rtk-pi`. So the relay
+ * showed the approver `describeCall(...)` — the command as the model wrote it —
+ * and rtk's handler then rewrote `event.input.command` to `rtk <something>`
+ * before pi's bash tool ran it.
+ *
+ * The stamp is how a handler tells a LATER handler about the same call, which is
+ * a mechanism this stack already uses: `pi-subagents-lite`'s `toolCallListener`
+ * writes `_resolvedAgent`, `model` and `thinking` onto this same object.
+ */
+describe('the approved-command stamp', () => {
+  it('records exactly what the approver read', () => {
+    const input: Record<string, unknown> = { command: '  git   status  ' };
+    markApproved(input, describeCall('bash', input));
+    // `describeCall` is what the Matrix prompt printed above the buttons, so the
+    // stamp is evidence rather than a flag: a transcript can say WHICH string was
+    // approved, not merely that something was.
+    expect(input[APPROVED_COMMAND_KEY]).toBe('git status');
+  });
+
+  it('is a plain key on the object pi hands to execute', () => {
+    // `validateToolArguments` runs BEFORE `beforeToolCall`, so an extra key is
+    // never rejected — the same reason the subagent listener can inject `model`.
+    const input: Record<string, unknown> = { command: 'pytest -q' };
+    markApproved(input, 'pytest -q');
+    expect(Object.keys(input)).toContain(APPROVED_COMMAND_KEY);
+    expect(input.command).toBe('pytest -q');
+  });
+
+  it('never throws on a shape it was not given', () => {
+    for (const bad of [undefined, null, 'not an object', 7]) {
+      markApproved(bad as never, 'x');
+    }
+  });
+
+  it('the extension stamps on the APPROVED branch and nowhere else', () => {
+    // Position is the assertion. A stamp written before the decision would tell
+    // rtk to stand down for a command nobody approved; one written after the
+    // `return` would never run at all.
+    const src = readFileSync(new URL('../extensions/index.ts', import.meta.url), 'utf8');
+    const ask = src.indexOf('await requestApproval(event.toolName, input, decision.reason)');
+    const stamp = src.indexOf('markApproved(input,');
+    const block = src.indexOf('blocked by the Matrix permission relay');
+    expect(ask > 0).toBe(true);
+    expect(stamp > ask).toBe(true);
+    expect(stamp < block).toBe(true);
+  });
+});
+
+describe('the two packages agree on the key', () => {
+  it("rtk-pi's source declares the same literal", () => {
+    // Vendor packages must not import each other — the compaction lock keeps
+    // three copies of its protocol for the same reason — so each side asserts
+    // against the other's source.
+    const src = readFileSync(new URL('../../rtk-pi/src/gate.ts', import.meta.url), 'utf8');
+    const declared = src.match(/export const APPROVED_COMMAND_KEY = "([^"]+)"/)?.[1];
+    expect(declared).toBe(APPROVED_COMMAND_KEY);
+  });
+
+  it('what this package writes is what that package recognises', async () => {
+    // The two literals matching is not the same fact as the two FUNCTIONS
+    // agreeing, and only one of them is what a tool call depends on. Both sides
+    // are pure, so the round trip can be run rather than reasoned about.
+    const { approvedAsWritten } = await import('../../rtk-pi/src/gate.ts');
+    const input: Record<string, unknown> = { command: 'git status' };
+    expect(approvedAsWritten(input)).toBe(false);
+    markApproved(input, describeCall('bash', input));
+    expect(approvedAsWritten(input)).toBe(true);
+  });
+
+  it('…and still reads it before it rewrites anything', () => {
+    const src = readFileSync(new URL('../../rtk-pi/extensions/index.ts', import.meta.url), 'utf8');
+    expect(src.includes('approvedAsWritten(event.input)')).toBe(true);
+    expect(src.indexOf('approvedAsWritten(event.input)') < src.indexOf('event.input.command = rewritten')).toBe(true);
+  });
+});
+
+/**
+ * AK2 — the guard tests the PROPERTY, not one spelling of it.
+ *
+ * Every case below was measured against the shipped module before the fix.
+ * The four marked ✘ in the module's own header passed the gate whose help text
+ * promises "ask on Matrix before rm -rf, sudo, force push, curl|sh, and
+ * similar" — so an operator who had asked to be asked was not asked.
+ *
+ * Removing `isRecursiveForceDelete`, `isWorkingTreeDiscard` or
+ * `isWorldWritableChmod` and restoring the old regex fails this suite; the
+ * "spellings it already knew" group is the control that the fix did not
+ * loosen anything.
+ */
+describe('dangerous: a property, not a spelling (AK2)', () => {
+  const gates = (command: string) => needsApproval('bash', bash(command), DANGEROUS).gate;
+
+  it('still catches every spelling the old regex knew — the control', () => {
+    for (const command of [
+      'rm -rf /tmp/x',
+      'rm -fr /tmp/x',
+      'rm -Rf /tmp/x',
+      'rm -vrf /tmp/x',
+      'sudo rm -rf /',
+      'bash -c "rm -rf /tmp/x"',
+      'find / -name x -exec rm -rf {} +',
+      'git reset --hard HEAD~1',
+      'git clean -fd',
+      'chmod 777 /etc',
+      'chmod -R 777 /x',
+    ]) {
+      expect({ command, gate: gates(command) }).toEqual({ command, gate: true });
+    }
+  });
+
+  it('catches the spellings it did not: rm', () => {
+    for (const command of [
+      'rm -rfv /tmp/x', //          a flag letter after the f defeated the trailing \b
+      'rm -r -f /tmp/x', //         two tokens instead of one cluster
+      'rm -f -r /tmp/x',
+      'rm --recursive --force /tmp/x', // the long spelling was never in the pattern
+      'rm --force --recursive /tmp/x',
+      'rm /tmp/x -rf', //           GNU rm takes flags after the operand
+      'rm -R --force /tmp/x',
+    ]) {
+      expect({ command, gate: gates(command) }).toEqual({ command, gate: true });
+    }
+  });
+
+  it('catches the spellings it did not: git clean, git reset, chmod', () => {
+    for (const command of [
+      'git clean --force -d',
+      'git clean --force --directory',
+      'git reset HEAD~1 --hard',
+      'chmod 0777 /etc',
+      'chmod a+rwx /etc',
+      'chmod o+w /etc/passwd',
+      'chmod 666 /etc/shadow',
+    ]) {
+      expect({ command, gate: gates(command) }).toEqual({ command, gate: true });
+    }
+  });
+
+  it('leaves alone what is not the property', () => {
+    for (const command of [
+      'rm -- -rf', //               deleting a FILE called -rf, not a tree
+      'rm -f /tmp/x', //            force without recursion
+      'rm -r /tmp/x', //            recursion without force
+      'docker rm -f x', //          not the rm this is about
+      'git clean -n', //            a dry run deletes nothing
+      'git reset --soft HEAD~1',
+      'chmod 755 /etc', //          no write bit for other
+      'chmod 0644 a.ts',
+      'chmod u+w a.ts', //          the owner, not everyone
+      'ls -rf',
+      'echo hello',
+    ]) {
+      expect({ command, gate: gates(command) }).toEqual({ command, gate: false });
+    }
+  });
+
+  it('names the same thing it always named, so the approver reads the same sentence', () => {
+    expect(needsApproval('bash', bash('rm -r -f /tmp/x'), DANGEROUS)).toEqual({
+      gate: true,
+      reason: 'recursive force delete',
+    });
+    expect(needsApproval('bash', bash('git clean --force -d'), DANGEROUS)).toEqual({
+      gate: true,
+      reason: 'discarding working-tree changes',
+    });
+    expect(needsApproval('bash', bash('chmod 0777 /x'), DANGEROUS)).toEqual({
+      gate: true,
+      reason: 'making something world-writable',
+    });
+  });
+
+  it('every guard still has a name, and the list did not shrink', async () => {
+    const { DANGEROUS_WHATS } = await import('../src/permission-gate.ts');
+    expect(DANGEROUS_WHATS).toEqual([
+      'recursive force delete',
+      'privilege escalation',
+      'piping a download into a shell',
+      'writing to a block device',
+      'formatting a filesystem',
+      'force push',
+      'discarding working-tree changes',
+      'publishing a package',
+      'powering the machine down',
+      'making something world-writable',
+      'destroying docker state',
+      'deleting cluster resources',
+      'destroying evidence of what ran',
+      'redirecting onto a disk',
+    ]);
   });
 });

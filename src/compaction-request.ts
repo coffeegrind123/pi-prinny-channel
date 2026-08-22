@@ -92,10 +92,84 @@ export function planCompaction(input: CompactionInput): CompactionPlan {
 export const COMPACTION_DEFER_LIMIT = 2;
 
 export interface PendingCompaction {
-  room: string;
+  /**
+   * Every room that asked for this compaction and is still owed an answer about
+   * it.
+   *
+   * Eighteenth pass (AI2). This was a single `room`, written by `runLocalCommand`
+   * as `pendingCompaction = { room, at: Date.now() }` under the comment *"One
+   * slot, last-write-wins: two senders asking during the same turn want one
+   * compaction, and the second is the one whose room is still expecting an answer
+   * soonest."*
+   *
+   * One compaction is right. One REPLY is not: each sender was told
+   * *"The session is mid-turn — I will compact as soon as it finishes rather than
+   * cutting it off"*, and the callbacks answer the room in the slot, so every
+   * sender but the last was told something would happen and then never heard
+   * again. `deliverInbound` marks their entry `answered` on the way past, so the
+   * undelivered sweep cannot report it either.
+   *
+   * The same module already answers two senders correctly when it acts
+   * immediately: `startCompaction` reads the lock, finds a holder, and tells the
+   * second one *"A compaction is already running…"*. It is only the DEFERRED
+   * path that had one slot and one voice.
+   *
+   * Two people asking in the same window is the ordinary case for a channel with
+   * two people on it — AF1 is the same premise, and pi's own follow-up drain is
+   * why both land inside one run — and the two are correlated rather than
+   * independent: a sender asks for a compaction BECAUSE the bot has gone slow,
+   * which is a thing both of them can see.
+   */
+  rooms: string[];
   at: number;
   /** Settlements this request has already let pass. See standAside. */
   stoodAside?: number;
+}
+
+/**
+ * Fold a new `/compact` request into the one that is already waiting.
+ *
+ * Eighteenth pass (AI2), and the rule is `mergeAwaiting`'s in `delivery.ts`, one
+ * map over: *a second message cannot un-ask the first*. One compaction still
+ * runs — that has always been right — and every room that asked for it is
+ * answered when it does.
+ *
+ * `at` is refreshed, because the newest ask is the one whose sender is waiting
+ * least patiently and the timestamp is only ever read for the log. `stoodAside`
+ * is carried, because the stand-aside budget belongs to the REQUEST rather than
+ * to a room, and resetting it on every new ask would let a busy channel starve a
+ * continuation indefinitely.
+ */
+export function mergePendingCompaction(
+  previous: PendingCompaction | undefined,
+  room: string,
+  at: number,
+): PendingCompaction {
+  const rooms = previous ? [...previous.rooms] : [];
+  if (!rooms.includes(room)) rooms.push(room);
+  return { rooms, at, stoodAside: previous?.stoodAside };
+}
+
+/**
+ * What a room is told when the compaction it was promised will not happen.
+ *
+ * Eighteenth pass (AI2). The promise is made in `planCompaction`'s `defer` reply
+ * and kept by `drainPendingCompaction` at `agent_settled`. Between those two
+ * moments the channel can be stopped — `/prinny stop`, `/prinny restart`, or
+ * `session_shutdown` — and `stopChannel` used to drop the request in silence
+ * while, ten lines up, denying every pending PERMISSION with a stated reason:
+ *
+ * > Deny rather than allow: the operator asked to be consulted, and the channel
+ * > going away is not consent.
+ *
+ * Same function, same teardown, same kind of promise. The sender is told before
+ * the sidecar goes, because after it there is no way to tell them anything.
+ */
+export function abandonedCompactionMessage(): string {
+  return (
+    'I said I would compact once the turn finished, and the channel is stopping before that happened, ' +
+    'so it will not run. Nothing is waiting on my side; ask again once I am back.'
+  );
 }
 
 /**

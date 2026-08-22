@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DELIVERY_GRACE_MS,
   mergeAwaiting,
+  sweepHasWork,
   unansweredMessage,
   unansweredRooms,
   undeliveredMessage,
@@ -522,5 +523,145 @@ describe('AG3 — a continuation is not sent into a running compaction', () => {
     // The sweep's sentence hedges — "it MAY have been compacting" — because it
     // has no observable. This one is chosen with the lock in hand.
     assert.doesNotMatch(held, /may have been/);
+  });
+});
+
+/**
+ * AL4 — the sweep that could not stop.
+ *
+ * `armDeliverySweep` arms a 30 s interval on the arrival of ANY inbound
+ * message. Stopping it was the sweep's own job, and the two tests were not the
+ * same test:
+ *
+ * ```
+ *   arm      a message arrived
+ *   disarm   nothing is reportable right now
+ *            AND no entry has `live === false`      ← a weaker question
+ * ```
+ *
+ * Nothing retires a dead entry: `forwardResult` deletes only the LIVE ones, and
+ * the sweep deliberately leaves a reported entry in place so a late `markLive`
+ * can still deliver the answer. So one undelivered report left an entry with
+ * `live: false, undeliveredReported: true` in the map for good — reportable
+ * never again, and `!entry.live` true forever. The interval woke every thirty
+ * seconds for the rest of the session with nothing to do.
+ *
+ * It needs no failure at all to reproduce. A Matrix `/loop status` arms the
+ * sweep on arrival and is marked `answered`, which is also `live: false`
+ * forever. One command is enough.
+ *
+ * The predicate is now `sweepHasWork`, which is `undeliveredRooms` with the
+ * clock removed and the same `awaitsVerdict` underneath, so the arm test and the
+ * disarm test cannot drift.
+ *
+ * See AL4 in `context/design/subagents-loop-verifier-lifetimes.md`.
+ */
+describe('AL4 — when the delivery sweep still has work', () => {
+  const work = (entries: Record<string, Entry>) => sweepHasWork(Object.entries(entries));
+
+  it('has work while a message is inside its grace', () => {
+    // Not reportable yet, and the timer is the only thing that will come back
+    // to look — so this is exactly the case a disarm must not fire on.
+    assert.equal(work({ '!a:example.org': { at: NOW, live: false } }), true);
+    assert.deepEqual(rooms({ '!a:example.org': { at: NOW, live: false } }), []);
+  });
+
+  it('has work for a message past its grace that has not been reported', () => {
+    assert.equal(work({ '!a:example.org': { at: NOW - DELIVERY_GRACE_MS - 1, live: false } }), true);
+  });
+
+  it('has none once the message has been reported', () => {
+    // The regression itself: this entry stays in the map for good, and
+    // `!entry.live` is true for it for good.
+    assert.equal(
+      work({
+        '!a:example.org': {
+          at: NOW - DELIVERY_GRACE_MS - 1,
+          live: false,
+          undeliveredReported: true,
+        },
+      }),
+      false
+    );
+  });
+
+  it('has none for a command this extension answered itself', () => {
+    // `/loop status` from Matrix. Never handed to pi, so `live` can never
+    // become true; one of these used to arm the interval permanently.
+    assert.equal(work({ '!a:example.org': { at: NOW, live: false, answered: true } }), false);
+  });
+
+  it('has none for a room pi took the message from', () => {
+    assert.equal(work({ '!a:example.org': { at: NOW, live: true } }), false);
+  });
+
+  it('has none for an empty map', () => {
+    assert.equal(work({}), false);
+  });
+
+  it('has work if ANY entry does, whatever the others say', () => {
+    assert.equal(
+      work({
+        '!done:example.org': { at: NOW, live: true },
+        '!reported:example.org': { at: NOW, live: false, undeliveredReported: true },
+        '!waiting:example.org': { at: NOW, live: false },
+      }),
+      true
+    );
+  });
+
+  it('asks the same question the report does, minus the clock', () => {
+    // The property that keeps them from drifting. For every entry that is past
+    // its grace, "is it reportable" and "does it hold the timer" must agree.
+    const cases: Entry[] = [
+      { at: NOW - DELIVERY_GRACE_MS - 1, live: false },
+      { at: NOW - DELIVERY_GRACE_MS - 1, live: true },
+      { at: NOW - DELIVERY_GRACE_MS - 1, live: false, answered: true },
+      { at: NOW - DELIVERY_GRACE_MS - 1, live: false, undeliveredReported: true },
+      { at: NOW - DELIVERY_GRACE_MS - 1, live: true, answered: true },
+    ];
+    for (const [index, entry] of cases.entries()) {
+      const key = `!c${index}:example.org`;
+      assert.equal(
+        work({ [key]: entry }),
+        rooms({ [key]: entry }).length > 0,
+        `case ${index}: ${JSON.stringify(entry)}`
+      );
+    }
+  });
+
+  it('is not suppressed by a running agent', () => {
+    // `undeliveredRooms` returns nothing while a run is in flight — the verdict
+    // waits for idle. Disarming on that would leave the arrival that armed the
+    // interval with nothing watching once the run ended.
+    assert.deepEqual(
+      undeliveredRooms(
+        Object.entries({ '!a:example.org': { at: NOW - DELIVERY_GRACE_MS - 1, live: false } }),
+        NOW,
+        true
+      ),
+      []
+    );
+    assert.equal(work({ '!a:example.org': { at: NOW - DELIVERY_GRACE_MS - 1, live: false } }), true);
+  });
+});
+
+describe('AL4 — the wiring', () => {
+  const source = readFileSync(join(PACKAGE_ROOT, 'extensions', 'index.ts'), 'utf8');
+  const sweep = source.slice(source.indexOf('function sweepUndelivered'));
+  const body = sweep.slice(0, sweep.indexOf('\n}\n'));
+
+  it('disarms on the predicate the arrival armed it with', () => {
+    assert.match(body, /!sweepHasWork\(awaitingReply\.entries\(\)\)/);
+    assert.doesNotMatch(body, /some\(\(entry\) => !entry\.live\)/);
+  });
+
+  it('reaches the disarm on the tick that reports the last message', () => {
+    // It used to sit behind `if (rooms.length === 0) { … return; }`, so the
+    // reporting tick could never disarm and the next one had to.
+    const report = body.indexOf('entry.undeliveredReported = true;');
+    const disarm = body.indexOf('clearInterval(deliveryTimer);');
+    assert.ok(report > 0 && disarm > report, 'the disarm is after the reporting loop');
+    assert.doesNotMatch(body.slice(0, disarm), /\n    return;\n/);
   });
 });

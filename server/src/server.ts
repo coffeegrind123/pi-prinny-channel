@@ -81,6 +81,7 @@ import {
   loadAccess,
   type Access,
 } from './access.js';
+import { connectWithRetry } from './connect.js';
 import { fetchMessages, renderHistory, searchMessages } from './history.js';
 import {
   MAX_ATTACHMENT_BYTES,
@@ -91,7 +92,12 @@ import {
   writeToInbox,
 } from './inbox.js';
 import { isMentioned } from './mentions.js';
-import { PERMISSION_CALLBACK_RE, parsePermissionReply } from './permissions.js';
+import {
+  EXPIRED_PERMISSION_MESSAGE,
+  PERMISSION_CALLBACK_RE,
+  PermissionRegistry,
+  parsePermissionReply,
+} from './permissions.js';
 import { enqueue, flush, readQueue, readWatermark } from './queue.js';
 import {
   CRYPTO_SNAPSHOT_PATH,
@@ -208,6 +214,53 @@ function buildBot(deviceId: string | undefined): Bot {
       log('stored the minted access token — later boots will not re-login');
     },
   });
+}
+
+/**
+ * How long a client this process is throwing away gets to shut down before the
+ * retry proceeds without it.
+ *
+ * The same five seconds `shutdown()` gives the published bot, and for the same
+ * reason: `stop()` flushes the Olm crypto store, and losing that forces every
+ * peer to re-key on the next boot. Capped for the same reason too — a hung
+ * `stop()` on the retry path would stop the retries, which is worse than the
+ * leak it is there to prevent.
+ */
+const DISCARD_STOP_MS = 5_000;
+
+/**
+ * Stop a client this process built and will not publish.
+ *
+ * Forge fork, twenty-first pass (AL3). See `connect.ts` for what was wrong: the
+ * connection retry loop constructed a client per attempt, forever, and nothing
+ * anywhere stopped one — while `state.ts` says in its own header that the
+ * crypto store "must never be shared between two running bots".
+ *
+ * Never throws. A failed teardown is logged and the retry continues: this is
+ * already the error path, and turning "could not stop the old client" into a
+ * reason not to try a new one would be the same mistake one level up.
+ */
+async function discardBot(candidate: Bot, attempt: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const stopped = await Promise.race([
+      Promise.resolve(candidate.stop()).then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), DISCARD_STOP_MS);
+        timer.unref?.();
+      }),
+    ]);
+    if (!stopped) {
+      log(
+        `the client from attempt ${attempt} did not stop within ${DISCARD_STOP_MS / 1000}s — ` +
+          'retrying anyway; it may still be holding the crypto store'
+      );
+    }
+  } catch (err) {
+    log(`could not stop the client from attempt ${attempt}: ${err}`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -354,11 +407,21 @@ const mcp = new Server(
 
 // ── Permission relay ─────────────────────────────────────────────────────────
 
-/** Full details for the "See more" expansion, keyed by request id. */
-const pendingPermissions = new Map<
-  string,
-  { tool_name: string; description: string; input_preview: string }
->();
+/**
+ * The prompts still worth answering.
+ *
+ * Forge fork, twentieth pass (AK4). This was a plain `Map` with a `set` on
+ * arrival and a `delete` on a decision, and the extension's `requestApproval`
+ * fails closed on a timeout without telling this side — so an unanswered prompt
+ * stayed here for the life of the process, and its Allow button stayed live in
+ * every paired sender's room. Pressing it wrote `✅ Allowed` into the room for a
+ * call that had already been blocked.
+ *
+ * The class and the reasoning live in `./permissions.ts`, which imports nothing
+ * and can therefore be tested; this file ends in a top-level
+ * `await mcp.connect(...)`, so importing it starts a sidecar.
+ */
+const pendingPermissions = new PermissionRegistry();
 
 function permissionKeyboard(requestId: string, expanded = false): InlineKeyboard {
   const keyboard = new (requireMatrix().InlineKeyboard)();
@@ -381,11 +444,14 @@ mcp.setNotificationHandler(
       tool_name: z.string(),
       description: z.string(),
       input_preview: z.string(),
+      // AK4: how long pi will actually wait. Optional so an older extension
+      // still works; see DEFAULT_PERMISSION_TTL_MS for what happens then.
+      timeout_ms: z.number().optional(),
     }),
   }),
   async ({ params }) => {
-    const { request_id, tool_name, description, input_preview } = params;
-    pendingPermissions.set(request_id, { tool_name, description, input_preview });
+    const { request_id, tool_name, description, input_preview, timeout_ms } = params;
+    pendingPermissions.add(request_id, { tool_name, description, input_preview }, timeout_ms);
 
     const access = loadAccess();
     // The listing under the buttons is what makes this work on a client with no
@@ -410,7 +476,7 @@ function decidePermission(requestId: string, behavior: 'allow' | 'deny'): void {
     method: 'notifications/claude/channel/permission',
     params: { request_id: requestId, behavior },
   });
-  pendingPermissions.delete(requestId);
+  pendingPermissions.remove(requestId);
 }
 
 // ── Tools ────────────────────────────────────────────────────────────────────
@@ -999,7 +1065,7 @@ function registerHandlers(bot: Bot): void {
     }
 
     if (behavior === 'more') {
-      const details = pendingPermissions.get(requestId);
+      const details = pendingPermissions.live(requestId);
       if (!details) {
         await ctx
           .answerCallbackQuery({ text: 'Those details are no longer available.' })
@@ -1026,15 +1092,25 @@ function registerHandlers(bot: Bot): void {
     }
 
     // Read before deciding — decidePermission drops the entry.
-    const details = pendingPermissions.get(requestId);
+    //
+    // AK4: and read it through `live()`, which is the difference between
+    // "nobody has answered this yet" and "pi stopped waiting for it 40 minutes
+    // ago". Answering the second one `✅ Allowed` writes a decision into the
+    // room that nothing acted on: the extension has already failed the call
+    // closed and its own handler logs the late reply as unknown.
+    const details = pendingPermissions.live(requestId);
+    if (!details) {
+      await ctx.answerCallbackQuery({ text: 'No longer waiting.' }).catch(() => undefined);
+      await ctx.editMessageText(EXPIRED_PERMISSION_MESSAGE).catch(() => undefined);
+      return;
+    }
     decidePermission(requestId, behavior);
     const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied';
     await ctx.answerCallbackQuery({ text: label }).catch(() => undefined);
     // Retire the buttons, so the same request cannot be answered twice and the
     // room shows what was decided. The edit carries the outcome, because a
     // keyboard that simply vanishes reads as a failure.
-    const heading = details ? `🔐 Permission: **${details.tool_name}**` : '🔐 Permission';
-    await ctx.editMessageText(`${heading}\n\n${label}`).catch(() => undefined);
+    await ctx.editMessageText(`🔐 Permission: **${details.tool_name}**\n\n${label}`).catch(() => undefined);
   });
 
   bot.on('message', async (ctx) => {
@@ -1140,38 +1216,48 @@ async function startMatrix(): Promise<void> {
   matrix = await import('@prinny/bot');
   log(`Matrix layer loaded in ${((Date.now() - startedLoading) / 1000).toFixed(1)}s`);
 
-  for (let attempt = 1; ; attempt += 1) {
-    try {
+  // AL3: the loop lives in `connect.ts` so it can be driven by a test without a
+  // homeserver. The split between `build` and `start` is the whole fix — after
+  // `build` resolves there is a client holding the crypto store, and every exit
+  // from that point on has to go through `discard`.
+  const next = await connectWithRetry<Bot>({
+    build: async () => {
+      // Before construction on purpose: a whoami that fails leaves nothing to
+      // stop, and that is the only reason this is not in `start` below.
       const deviceId = await resolveDeviceId();
-      const next = buildBot(deviceId);
-      registerHandlers(next);
-      await next.setMyCommands(COMMANDS);
-      await next.start();
-      // Published only once `start()` resolves, so no tool can reach a client
-      // that is half constructed.
-      bot = next;
-      wireInvites();
-      started = true;
-      log(`connected as ${creds.userId}`);
-      const pending = readQueue().length;
-      if (pending > 0) log(`${pending} message(s) queued while away — delivering`);
-      void flushQueue();
-      const stray = divertedWrites();
-      if (stray > 0) {
-        // Worth saying out loud: without the guard each of these would have
-        // been a JSON-RPC parse error with no clue as to its origin.
-        log(`kept ${stray} stray stdout write(s) off the MCP stream`);
-      }
-      return;
-    } catch (err) {
-      if (shuttingDown) return;
-      const delay = Math.min(1000 * attempt, 30_000);
-      log(`connection failed (attempt ${attempt}): ${err}; retrying in ${delay / 1000}s`);
-      // Outbound tools would fail anyway without a client, and the session
-      // stays alive on stdin, so retrying forever beats exiting: a homeserver
-      // that comes back should not need the user to restart pi.
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
+      return buildBot(deviceId);
+    },
+    start: async (candidate) => {
+      registerHandlers(candidate);
+      await candidate.setMyCommands(COMMANDS);
+      await candidate.start();
+    },
+    discard: discardBot,
+    // Outbound tools would fail anyway without a client, and the session stays
+    // alive on stdin, so retrying forever beats exiting: a homeserver that comes
+    // back should not need the user to restart pi.
+    delayMs: (attempt) => Math.min(1000 * attempt, 30_000),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    onError: (attempt, err, delay) =>
+      log(`connection failed (attempt ${attempt}): ${err}; retrying in ${delay / 1000}s`),
+    stopping: () => shuttingDown,
+  });
+  if (!next) return;
+
+  // Published only once `start()` resolves, so no tool can reach a client that
+  // is half constructed.
+  bot = next;
+  wireInvites();
+  started = true;
+  log(`connected as ${creds.userId}`);
+  const pending = readQueue().length;
+  if (pending > 0) log(`${pending} message(s) queued while away — delivering`);
+  void flushQueue();
+  const stray = divertedWrites();
+  if (stray > 0) {
+    // Worth saying out loud: without the guard each of these would have been a
+    // JSON-RPC parse error with no clue as to its origin.
+    log(`kept ${stray} stray stdout write(s) off the MCP stream`);
   }
 }
 

@@ -7,6 +7,8 @@
  * tool calls, and neither of those is anybody's answer.
  */
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from './harness.ts';
 import {
   SentRegistry,
@@ -15,6 +17,7 @@ import {
   describeEmptyEnding,
   endedWithoutAnswering,
   finalAssistantText,
+  resolveActionRoom,
 } from '../src/forwarding.ts';
 import { renderInboundMessage } from '../src/inbound.ts';
 
@@ -498,5 +501,86 @@ describe('a truncated turn is named as truncated', () => {
       99
     );
     expect((out as { reason: string }).reason).toBe('truncated');
+  });
+});
+
+/**
+ * AI4 — the tool guessed where the forwarder refuses.
+ *
+ * `forwardToMatrix` will not send when more than one room is live, because
+ * "guessing would send one person's conversation to another — worse than
+ * silence, and not undoable". The `prinny` tool reaches the same sidecar `reply`
+ * and filled `room_id` from `lastInbound`, a one-slot last-write-wins variable
+ * written on every arrival.
+ *
+ * With two rooms live — the ordinary case for a channel with two people on it,
+ * and AF1's own premise — the model answering the FIRST sender sent that answer
+ * to the SECOND. It could not name the right room either: `renderInboundMessage`
+ * drops `room_id` from what the model sees, on purpose.
+ */
+describe('AI4 — which room a prinny(…) call is about', () => {
+  it('one live room: unchanged, and that is the ordinary case', () => {
+    const out = resolveActionRoom({ lastInbound: '!a:example.org', liveRooms: ['!a:example.org'] });
+    expect(out).toEqual({ room: '!a:example.org' });
+  });
+
+  it('two live rooms: refuses rather than guessing', () => {
+    const out = resolveActionRoom({ lastInbound: '!b:example.org', liveRooms: ['!a:example.org', '!b:example.org'] });
+    expect('refuse' in out).toBe(true);
+    const reason = (out as { refuse: string }).refuse;
+    expect(reason.includes('2 Matrix conversations')).toBe(true);
+    // Actionable rather than a dead end: it says what happens next and that a
+    // retry is not it, because AF1's retirement notice is about to tell both.
+    expect(reason.includes('do not retry')).toBe(true);
+    expect(reason.includes('room_id')).toBe(true);
+  });
+
+  it('an explicit room_id still wins, so acting on some other room stays possible', () => {
+    const out = resolveActionRoom({
+      explicit: '!c:example.org',
+      lastInbound: '!b:example.org',
+      liveRooms: ['!a:example.org', '!b:example.org'],
+    });
+    expect(out).toEqual({ room: '!c:example.org' });
+  });
+
+  it('no live room: the last arrival, which cannot mis-route because nobody is waiting', () => {
+    expect(resolveActionRoom({ lastInbound: '!a:example.org', liveRooms: [] })).toEqual({ room: '!a:example.org' });
+  });
+
+  it('nothing at all: the sentence the tool already had', () => {
+    const out = resolveActionRoom({ liveRooms: [] });
+    expect((out as { refuse: string }).refuse.includes('nothing has arrived')).toBe(true);
+  });
+
+  it('the premise: the model is never shown room_id, so it cannot resolve this itself', () => {
+    const rendered = renderInboundMessage({
+      content: 'hello',
+      meta: { room_id: '!a:example.org', message_id: '$1', user: 'Bob' },
+    });
+    expect(rendered.includes('!a:example.org')).toBe(false);
+  });
+});
+
+describe('AI4 — the wiring', () => {
+  const source = readFileSync(new URL('../extensions/index.ts', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '');
+
+  it('the tool asks resolveActionRoom instead of reading lastInbound directly', () => {
+    const at = source.indexOf('async execute(_id, params)');
+    const body = source.slice(at, source.indexOf('\n  });', at));
+    expect(body).toContain('resolveActionRoom({');
+    expect(/\?\? lastInbound\.room;/.test(body)).toBe(false);
+  });
+
+  it('both refusals read the same "waiting" predicate', () => {
+    // The two used to be the same expression written twice — and only one of
+    // them existed. `liveRooms()` is what stops them drifting on what waiting
+    // means.
+    const forward = source.slice(source.indexOf('async function forwardToMatrix('));
+    expect(forward.slice(0, forward.indexOf('\n}'))).toContain('const rooms = liveRooms();');
+    const at = source.indexOf('async execute(_id, params)');
+    expect(source.slice(at, source.indexOf('\n  });', at))).toContain('liveRooms: liveRooms()');
   });
 });

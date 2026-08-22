@@ -230,3 +230,60 @@ describe('child death', () => {
     expect(message).toContain('not running');
   });
 });
+
+/**
+ * AK3 — a request from the sidecar is not a reply to ours.
+ *
+ * JSON-RPC gives a server-initiated REQUEST both an `id` and a `method`.
+ * `dispatch` used to branch on `typeof id === 'number'` first, so such a
+ * message was matched against `pending` and, on a hit,
+ * `pending.resolve(message.result)` — with `message.result` undefined. The
+ * client's own outstanding call therefore resolved with nothing, no error, and
+ * no sign anything had gone wrong.
+ *
+ * `nextId` starts at 1 and `initialize` is the first thing this client sends,
+ * so the first server request in a fresh process would have resolved the
+ * HANDSHAKE: `start()` returns, `handshakeComplete` is true, and the channel
+ * reads as up while the sidecar never answered.
+ *
+ * The `method not found` reply below is not new — it was written for exactly
+ * this case, and its own comment says "a server-initiated *request* (has an
+ * id)". It was unreachable for a numeric id, which is the only kind anything
+ * sends. Reordering the two branches is the whole fix.
+ */
+describe('a server-initiated request (AK3)', () => {
+  it('is answered, and does not resolve the call it collides with', async () => {
+    const { child, stderr } = connect('serverrequest', { requestTimeoutMs: 1_500 });
+    await child.start();
+
+    let resolved: unknown;
+    let rejected: Error | undefined;
+    await child
+      .callTool('reply', { text: 'anything' })
+      .then((value) => {
+        resolved = value;
+      })
+      .catch((err: Error) => {
+        rejected = err;
+      });
+
+    // BEFORE: resolved with `{ content: [] }` the moment the request arrived —
+    // an empty success for a call the sidecar never ran.
+    expect(resolved).toBeUndefined();
+    expect(rejected?.message).toContain('tools/call timed out');
+
+    // …and the request itself got the answer the code always meant to send.
+    await settle();
+    const reply = stderr.join('');
+    expect(reply).toContain('client-reply');
+    expect(reply).toContain('-32601');
+    expect(reply).toContain('method not found: ping');
+  });
+
+  it('still dispatches an ordinary notification, which has no id at all', async () => {
+    const { child, notifications } = connect();
+    await child.start();
+    await settle();
+    expect(notifications.some((n) => n.method === 'notifications/claude/channel')).toBe(true);
+  });
+});

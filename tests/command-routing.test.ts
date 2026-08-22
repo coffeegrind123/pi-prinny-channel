@@ -9,7 +9,13 @@
  */
 
 import { describe, expect, it } from './harness.ts';
-import { KNOWN_COMMANDS, MATRIX_ALLOWED, MATRIX_LOCAL, classifyMatrixCommand } from '../src/command-routing.ts';
+import {
+  KNOWN_COMMANDS,
+  MATRIX_ALLOWED,
+  MATRIX_DEFAULT_SUBCOMMAND,
+  MATRIX_LOCAL,
+  classifyMatrixCommand,
+} from '../src/command-routing.ts';
 
 describe('classifyMatrixCommand — what runs', () => {
   it('runs an allowed command', () => {
@@ -50,8 +56,16 @@ describe('classifyMatrixCommand — what runs', () => {
     }
   });
 
+  /**
+   * Nineteenth pass (AJ1): this used to read `/stack something`, and it passed
+   * because `stack` was `null` — the whole command allowed, arguments and all.
+   * That is the premise the finding was about, so the assertion moves to the
+   * entry that really is `null` rather than being deleted: "a command whose
+   * allow-list is `null` runs with whatever arguments follow it" is still the
+   * rule, and `/loop` is still the command it is true of.
+   */
   it('runs an allowed command with arguments', () => {
-    const out = classifyMatrixCommand('/stack something');
+    const out = classifyMatrixCommand('/loop something');
     expect(out.kind).toBe('run');
   });
 
@@ -230,5 +244,89 @@ describe('the thirteenth pass — what the tables did not say', () => {
     const check = classifyMatrixCommand('/loop run --check x') as { reason: string };
     expect(model.reason).toContain('whole session');
     expect(check.reason).not.toContain('whole session');
+  });
+});
+
+/**
+ * AJ1 (nineteenth pass) — the entry that was `null`, and the actor nobody named.
+ *
+ * `.pi/extensions/stack.ts` labels its whole command surface
+ * `--- user-only control ---` and its own `/stack help` says *"every mutation
+ * above is a user-only command on purpose"*. "User-only" was decided against the
+ * MODEL, which cannot type a slash command. This table is where a THIRD actor
+ * gets in, and `stack: null` handed that actor the whole thing — `up`, `smoke`,
+ * `bench ARGS`, `logs` and `slots erase` with no confirmation at all, and five
+ * more behind an unattributed dialog in somebody else's terminal.
+ *
+ * It is AD6's own argument one line up in the same object: every branch of
+ * `/stack` is `pi.exec`, which emits no `tool_call`, so the permission relay,
+ * `rtk-pi`'s gate and the compaction guard's output cap all miss it.
+ */
+describe('the nineteenth pass — /stack, and who is allowed to run it', () => {
+  it('refuses every /stack subcommand that runs something', () => {
+    for (const line of [
+      '/stack up',
+      '/stack down',
+      '/stack restart llama',
+      '/stack smoke',
+      '/stack bench --repeat 3',
+      '/stack set CTX_SIZE=65536',
+      '/stack mode prose',
+      '/stack slots erase',
+      '/stack slots save',
+      '/stack logs forge',
+      '/stack env',
+    ]) {
+      const out = classifyMatrixCommand(line);
+      expect(out.kind).toBe('refuse');
+    }
+  });
+
+  it('keeps the two forms the sidecar advertises', () => {
+    // "Show local model stack status" is what a Matrix client's `/` menu says
+    // this command is, and it has to keep being true.
+    expect(classifyMatrixCommand('/stack').kind).toBe('run');
+    expect(classifyMatrixCommand('/stack status').kind).toBe('run');
+    expect(classifyMatrixCommand('/stack help').kind).toBe('run');
+  });
+
+  it('a bare /stack is the DEFAULT subcommand, not the empty string', () => {
+    // The half of the fix that is easy to forget: `stack.ts`'s handler defaults
+    // `argv[0] ?? "status"`, and the refusal below already had a sentence for
+    // "(no argument)" — so narrowing the list without a default would have
+    // refused the one form the menu offers.
+    expect(MATRIX_DEFAULT_SUBCOMMAND.stack).toBe('status');
+    expect(classifyMatrixCommand('/stack')).toEqual({ kind: 'run', name: 'stack', text: '/stack' });
+  });
+
+  it('the refusal names what IS allowed, and the route that still works', () => {
+    const out = classifyMatrixCommand('/stack restart llama') as { reason: string };
+    expect(out.reason).toContain('/stack status');
+    // The sender's real question — "is the model up?" — is answered by asking in
+    // prose: the model calls the read-only `stack_status` tool and replies. That
+    // route reaches the sender; a `/stack status` entry never leaves the
+    // terminal.
+    expect(out.reason).toContain('ordinary words');
+  });
+
+  it('names the subcommand the sender actually wrote, not the default', () => {
+    const out = classifyMatrixCommand('/stack up') as { reason: string };
+    expect(out.reason).toContain('/stack up');
+    expect(out.reason).not.toContain('(no argument)');
+  });
+
+  it('control — /loop is still allowed in full', () => {
+    // AD6's boundary is unchanged: the flags are refused, the subcommands are
+    // not, and this pass narrows a different entry for a different reason.
+    expect(MATRIX_ALLOWED.loop).toBe(null);
+    expect(classifyMatrixCommand('/loop start ship it').kind).toBe('run');
+    expect(classifyMatrixCommand('/loop stop').kind).toBe('run');
+  });
+
+  it('control — the per-subcommand arm now has a user, and it is exercised', () => {
+    // The value type has been `readonly string[] | null` since the table was
+    // written, and BOTH entries were `null` — so this arm had never once run
+    // against real traffic. It is the mechanism the finding was about.
+    expect(Array.isArray(MATRIX_ALLOWED.stack)).toBe(true);
   });
 });

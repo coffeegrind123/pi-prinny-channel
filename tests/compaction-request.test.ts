@@ -14,7 +14,13 @@
 import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from './harness.ts';
-import { COMPACTION_DEFER_LIMIT, planCompaction, standAside } from '../src/compaction-request.ts';
+import {
+  abandonedCompactionMessage,
+  COMPACTION_DEFER_LIMIT,
+  mergePendingCompaction,
+  planCompaction,
+  standAside,
+} from '../src/compaction-request.ts';
 
 describe('planCompaction', () => {
   it('waits when a turn is in flight, rather than cancelling it', () => {
@@ -129,7 +135,9 @@ describe('the wiring the rule needs', () => {
  * the rule, and the bound.
  */
 describe('standAside', () => {
-  const pending = { room: '!r:example.org', at: 1 };
+  // AI2: `rooms`, plural, since a deferred request can be asked for by more
+  // than one sender in the same turn. `standAside` treats it opaquely either way.
+  const pending = { rooms: ['!r:example.org'], at: 1 };
 
   it('holds the compaction back when a continuation has just been started', () => {
     const held = standAside(pending, true);
@@ -150,7 +158,7 @@ describe('standAside', () => {
     // AE4, and `sendUserMessage` cannot report it. An unbounded stand-aside would
     // leave the sender waiting for a compaction they were told would happen "as
     // soon as it finishes".
-    let current: { room: string; at: number; stoodAside?: number } = pending;
+    let current: { rooms: string[]; at: number; stoodAside?: number } = pending;
     for (let round = 0; round < COMPACTION_DEFER_LIMIT; round += 1) {
       const held = standAside(current, true);
       expect(held.wait).toBe(true);
@@ -162,9 +170,9 @@ describe('standAside', () => {
   it('does not mutate the request it was given', () => {
     // The caller assigns the returned value; a rule that edited its input would
     // have counted a stand-aside that never happened on the `wait: false` path.
-    const original = { room: '!r:example.org', at: 1 };
+    const original = { rooms: ['!r:example.org'], at: 1 };
     standAside(original, true);
-    expect(original).toEqual({ room: '!r:example.org', at: 1 });
+    expect(original).toEqual({ rooms: ['!r:example.org'], at: 1 });
   });
 
   it('the bound is the continuation budget, not a number of its own', () => {
@@ -198,5 +206,105 @@ describe('AE2 — the wiring, where the rule is applied', () => {
     // handler could not have asked.
     expect(source).toContain('async function forwardResult(): Promise<boolean>');
     expect(source).toContain('return retrying;');
+  });
+});
+
+/**
+ * AI2 — one compaction, and everyone who asked for it.
+ *
+ * `runLocalCommand`'s defer path wrote `pendingCompaction = { room, at }` under
+ * *"One slot, last-write-wins"*. One compaction is right. One REPLY is not: each
+ * sender had already been told *"The session is mid-turn — I will compact as
+ * soon as it finishes rather than cutting it off"*, and only the room in the
+ * slot ever heard again. `deliverInbound` sets `answered` on the way past, so
+ * the undelivered sweep could not report it either.
+ *
+ * The control is in the same module: when the request is served IMMEDIATELY,
+ * `startCompaction` reads the lock and tells a second asker *"A compaction is
+ * already running…"*. Two senders were answered correctly on the path that acts
+ * and lost on the path that defers.
+ */
+describe('AI2 — mergePendingCompaction', () => {
+  it('keeps every room that asked', () => {
+    const first = mergePendingCompaction(undefined, '!a:example.org', 1);
+    const second = mergePendingCompaction(first, '!b:example.org', 2);
+    expect(second.rooms).toEqual(['!a:example.org', '!b:example.org']);
+  });
+
+  it('does not repeat a room that asked twice', () => {
+    const once = mergePendingCompaction(undefined, '!a:example.org', 1);
+    const twice = mergePendingCompaction(once, '!a:example.org', 2);
+    expect(twice.rooms).toEqual(['!a:example.org']);
+  });
+
+  it('does not mutate the request it was given', () => {
+    const first = mergePendingCompaction(undefined, '!a:example.org', 1);
+    mergePendingCompaction(first, '!b:example.org', 2);
+    expect(first.rooms).toEqual(['!a:example.org']);
+  });
+
+  it('refreshes the timestamp and CARRIES the stand-aside count', () => {
+    // The budget belongs to the request, not to a room: resetting it on every
+    // new ask would let a busy channel starve a continuation indefinitely, which
+    // is the bound AE2 exists to keep.
+    const held = standAside(mergePendingCompaction(undefined, '!a:example.org', 1), true);
+    const carried = mergePendingCompaction((held as { pending: { rooms: string[]; at: number; stoodAside?: number } }).pending, '!b:example.org', 9);
+    expect(carried.stoodAside).toBe(1);
+    expect(carried.at).toBe(9);
+  });
+
+  it('the abandonment sentence says the promise will not be kept, and why', () => {
+    const text = abandonedCompactionMessage();
+    expect(text.includes('will not run')).toBe(true);
+    expect(text.includes('ask again')).toBe(true);
+    // Never invents a compaction that happened.
+    expect(/compacted the conversation/i.test(text)).toBe(false);
+  });
+});
+
+describe('AI2 — the wiring', () => {
+  const source = readFileSync(new URL('../extensions/index.ts', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '');
+
+  it('the deferred slot is merged, not replaced', () => {
+    const body = source.slice(source.indexOf('function runLocalCommand('));
+    const defer = body.slice(0, body.indexOf('startCompaction('));
+    expect(defer).toContain('mergePendingCompaction(pendingCompaction, room, Date.now())');
+    expect(/pendingCompaction = \{ room,/.test(defer)).toBe(false);
+  });
+
+  it('startCompaction answers every room that asked', () => {
+    const fn = source.slice(source.indexOf('function startCompaction('));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain('for (const room of rooms)');
+  });
+
+  it('stopChannel tells them it will not happen, while it still can', () => {
+    // The control is a few lines down in the same function: pendingPermissions
+    // are resolved 'deny' because "the channel going away is not consent". Same
+    // teardown, same kind of promise.
+    //
+    // The ORDER is load-bearing and is the second half of the fix: `callSidecar`
+    // goes through `requireChannel()`, which reads `child`, so a reply attempted
+    // after `child = null` throws instead of being sent.
+    const fn = source.slice(source.indexOf('async function stopChannel('));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain("pending.resolve('deny')");
+    const abandon = body.indexOf('abandonPendingCompaction();');
+    const detach = body.indexOf('child = null;');
+    const stop = body.indexOf('instance.stop()');
+    expect(abandon).not.toBe(-1);
+    expect(abandon < detach).toBe(true);
+    expect(abandon < stop).toBe(true);
+  });
+
+  it('and clears the slot before replying, so a restart cannot answer twice', () => {
+    const fn = source.slice(source.indexOf('function abandonPendingCompaction('));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    const cleared = body.indexOf('pendingCompaction = undefined;');
+    const replied = body.indexOf('callSidecar(');
+    expect(cleared).not.toBe(-1);
+    expect(cleared < replied).toBe(true);
   });
 });

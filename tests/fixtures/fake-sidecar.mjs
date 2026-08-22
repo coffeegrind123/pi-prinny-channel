@@ -16,6 +16,13 @@
  *   silent      completes the handshake and never answers a tool call
  *   nohandshake never answers `initialize`
  *   crash       exits as soon as it is initialized
+ *   serverrequest
+ *               answers a tools/call with a server-initiated REQUEST carrying
+ *               the SAME id, which is exactly what a JSON-RPC server does when
+ *               it asks the client something (ping, roots/list,
+ *               sampling/createMessage) while a call is outstanding. Whatever
+ *               the client sends back is echoed to stderr so a test can read
+ *               it. See AK3.
  */
 
 const MODE = process.env.PRINNY_FAKE_MODE ?? 'normal';
@@ -36,6 +43,14 @@ function send(message) {
 
 function handle(message) {
   const { id, method, params } = message;
+
+  // A reply from the CLIENT — it has an id and no method. The only one this
+  // fixture ever provokes is the answer to the server request `serverrequest`
+  // mode sends, so put it where a test can read it.
+  if (method === undefined && id !== undefined) {
+    process.stderr.write(`client-reply ${JSON.stringify(message)}\n`);
+    return;
+  }
 
   if (method === 'initialize') {
     if (MODE === 'nohandshake') return;
@@ -96,6 +111,11 @@ function handle(message) {
 
   if (method === 'tools/call') {
     if (MODE === 'silent') return;
+    if (MODE === 'serverrequest') {
+      // Not a reply — a REQUEST, wearing the id the client is waiting on.
+      send({ jsonrpc: '2.0', id, method: 'ping', params: {} });
+      return;
+    }
     if (MODE === 'noisy') {
       // Exactly the failure the sidecar's stdout guard exists to prevent.
       process.stdout.write('Downloading Rust crypto library\n');

@@ -311,6 +311,78 @@ export function blockMatches(
 }
 
 /**
+ * Which room a `prinny(…)` tool call is about.
+ *
+ * ## The refusal this restates, and the hole it was restated into
+ *
+ * `forwardToMatrix` above refuses to send when more than one room is live:
+ *
+ * > Only when exactly one room is waiting. With two, there is no way to tell
+ * > whose answer this is, and guessing would send one person's conversation to
+ * > another — worse than silence, and not undoable.
+ *
+ * The `prinny` TOOL is the second route into the same send, and it guessed. Its
+ * schema documents `room_id` as optional and the extension fills it from
+ * `lastInbound`, a one-slot module variable written by `deliverInbound` on every
+ * arrival, under *"Last-write-wins is the right rule: actions with no explicit
+ * room are about the message being answered now, and that is the most recent one
+ * delivered."*
+ *
+ * That premise holds for one sender and fails for two, and two is the ordinary
+ * case for a channel with two people on it — which is AF1's whole argument: pi's
+ * agent loop drains its follow-up queue inside one run, so two messages that
+ * arrive while it is busy are consumed by ONE run and both rooms go live. The
+ * model then sees two `[matrix]` blocks, answers the first, and
+ * `prinny(action:"reply")` sends that answer to the second sender.
+ *
+ * It cannot recover by naming the room either. `renderInboundMessage` DROPS
+ * `room_id` from what the model sees, deliberately — *"the model is not the
+ * right place to hold a routing identifier it never chose"* — so the one
+ * parameter that would disambiguate is the one thing the model was never given.
+ * The tool's own comment says `room_id` is "neither in the schema nor something
+ * the model can get wrong", and that is true of getting it wrong and false of
+ * the extension getting it wrong on the model's behalf.
+ *
+ * `history` and `search` leak the other way: they would read a stranger's
+ * conversation INTO the context.
+ *
+ * ## What this does instead
+ *
+ * The same answer `forwardToMatrix` gives, at the same moment, for the same
+ * reason: nothing is sent, and AF1's retirement notice tells both senders that
+ * an answer could not be attributed and to ask again. An explicit `room_id`
+ * still wins, so acting on some other room stays possible.
+ *
+ * `liveRooms` is the set `forwardToMatrix` filters on — entries with
+ * `live === true` — so the two refusals cannot drift apart on what "waiting"
+ * means.
+ */
+export function resolveActionRoom(input: {
+  explicit?: string | undefined;
+  lastInbound?: string | undefined;
+  liveRooms: readonly string[];
+}): { room: string } | { refuse: string } {
+  const explicit = typeof input.explicit === 'string' && input.explicit ? input.explicit : undefined;
+  if (explicit) return { room: explicit };
+
+  if (input.liveRooms.length > 1) {
+    return {
+      refuse:
+        `${input.liveRooms.length} Matrix conversations are waiting in this turn, so I cannot tell which one ` +
+        'this is for — nothing was done. Each of them is told at the end of the turn that an answer could not ' +
+        'be attributed and to ask again, so do not retry this call. Pass room_id if you genuinely mean one of them.',
+    };
+  }
+
+  // One live room is the ordinary case and the one `lastInbound` was written
+  // for. Zero live rooms is a terminal-only turn acting on the last thing that
+  // arrived, which is unchanged and cannot mis-route: nobody is waiting.
+  const room = input.liveRooms.length === 1 ? input.liveRooms[0]! : input.lastInbound;
+  if (!room) return { refuse: 'No Matrix room to act on: nothing has arrived in this session yet.' };
+  return { room };
+}
+
+/**
  * What has already been said to whom, for the length of one run.
  *
  * A model that both writes an answer and calls `prinny(reply)` with the same

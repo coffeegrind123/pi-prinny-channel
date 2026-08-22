@@ -98,10 +98,82 @@ export const KNOWN_COMMANDS: readonly string[] = [
  * command. That is a blast-radius and cost property, not a security one, and it
  * is the operator's call rather than this file's — `/loop stop` is one message
  * away from the same phone.
+ *
+ * ## `/stack`, nineteenth pass (AJ1) — the entry that was `null` and should not
+ * have been
+ *
+ * `stack: null` allowed the WHOLE command, and `.pi/extensions/stack.ts` is the
+ * one command in this stack whose body is `pi.exec` from end to end. Its own
+ * help says the opposite:
+ *
+ * > The model can call stack_status to read the stack. It cannot change it:
+ * > every mutation above is a user-only command on purpose.
+ *
+ * — under a section header that reads `--- user-only control ---`. "User-only"
+ * was written against the MODEL, which cannot type a slash command. It was never
+ * asked of the third actor in this process, and this table is where that actor
+ * gets in. What reached `pi.exec` from a Matrix message, with no confirmation
+ * and no permission relay:
+ *
+ *   /stack up            bash scripts/up.sh                  900 s
+ *   /stack smoke         bash scripts/smoke-test.sh          900 s
+ *   /stack bench ARGS    docker compose build + run, ARGS  3,600 s
+ *   /stack logs [svc]    docker logs
+ *   /stack slots erase   POST /slots/{id}?action=erase — the one slots action
+ *                        that is deliberately NOT behind a confirmation
+ *
+ * and five more (`down`, `restart`, `set`, `mode`, `slots save|restore`) behind
+ * `ctx.ui.confirm`, which is a modal in the OPERATOR's terminal that does not
+ * say a Matrix sender asked for it — and which `noOpUIContext.confirm` answers
+ * `false` headless, so those were refused in a `pi -p` run and pop an
+ * unattributed dialog in a TUI one.
+ *
+ * This is AD6's own argument, one line up in the same object. AD6 refused
+ * `--check` because *"its value is run as a shell command every iteration, and
+ * that one does not pass the permission relay"* — `pi.exec` is `execCommand`, it
+ * emits no `tool_call`, so the relay, `rtk-pi`'s gate and the guard's output cap
+ * all miss it. Every branch of `/stack` is that same door.
+ *
+ * The mechanism to say so already existed and had no user: the value type is
+ * `readonly string[] | null` and BOTH entries were `null`, so the per-subcommand
+ * arm below — written, tested, and the reason this is a table rather than a Set
+ * — had never once been exercised against real traffic.
+ *
+ * The list is exactly what the sidecar already advertises to a Matrix client:
+ * *"Show local model stack status"*. See `advertisedCommands()`.
+ *
+ * **Considered and not taken:** dropping `stack` from this table altogether and
+ * from `advertisedCommands()` with it. It is arguably the more honest answer —
+ * `/stack status` from Matrix writes a `stack-report` ENTRY, which is rendered in
+ * the terminal and never sent anywhere, so the sender learns nothing from it,
+ * and the question they actually have ("is the model up?") is already answered
+ * by asking in prose: the model calls the read-only `stack_status` tool and
+ * replies. That is a bigger change to an advertised surface than the finding
+ * needs, so it is written down rather than made.
  */
 export const MATRIX_ALLOWED: Readonly<Record<string, readonly string[] | null>> = {
-  stack: null,
+  stack: ['status', 'help'],
   loop: null,
+};
+
+/**
+ * The subcommand a bare `/name` means, for the commands whose allow-list is a
+ * list rather than `null`.
+ *
+ * Nineteenth pass (AJ1), and it is the half of the fix that is easy to forget.
+ * `/stack` with no argument is the form the sidecar advertises and the form
+ * `stack.ts`'s own handler defaults (`const sub = (argv[0] ?? "status")`) — but
+ * the arm below reads the first WORD, which is the empty string, and the
+ * refusal it writes already anticipates that shape: *"/stack (no argument)
+ * cannot be run from Matrix"*. Narrowing the list without this would have
+ * refused the one form the menu offers.
+ *
+ * Stated as a table rather than inferred from the first entry of the allow-list,
+ * because "the default subcommand" and "the first thing a sender may run" are
+ * two different facts and only one of them belongs to this file.
+ */
+export const MATRIX_DEFAULT_SUBCOMMAND: Readonly<Record<string, string>> = {
+  stack: 'status',
 };
 
 /**
@@ -250,14 +322,18 @@ export function classifyMatrixCommand(body: unknown): MatrixCommand {
   const allowedArgs = MATRIX_ALLOWED[name];
   if (allowedArgs === null) return { kind: 'run', name, text: trimmed };
 
-  const first = (rest.split(/\s+/)[0] ?? '').toLowerCase();
+  // AJ1: an omitted subcommand is a subcommand — the one the command's own
+  // handler defaults to. See MATRIX_DEFAULT_SUBCOMMAND.
+  const written = (rest.split(/\s+/)[0] ?? '').toLowerCase();
+  const first = written || (MATRIX_DEFAULT_SUBCOMMAND[name] ?? '');
   if (allowedArgs.includes(first)) return { kind: 'run', name, text: trimmed };
   return {
     kind: 'refuse',
     name,
     reason:
-      `/${name} ${first || '(no argument)'} cannot be run from Matrix. ` +
-      `Allowed here: ${allowedArgs.map((arg) => `/${name} ${arg}`).join(', ')}.`,
+      `/${name} ${written || '(no argument)'} cannot be run from Matrix. ` +
+      `Allowed here: ${allowedArgs.map((arg) => `/${name} ${arg}`).join(', ')}. ` +
+      `Ask me in ordinary words instead: I can do read-only things with tools and tell you the answer.`,
   };
 }
 
