@@ -194,6 +194,9 @@ export function gate(
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access };
     if (access.dmPolicy === 'allowlist') return { action: 'drop', reason: 'not allowlisted' };
 
+    // `Object.entries` is own-keys-only, so this loop was always correct — it is
+    // the CONTROL for AO6, and the reason the sidecar's own pairing path never
+    // showed the symptom the extension's `pair()` did.
     for (const [code, entry] of Object.entries(access.pending)) {
       if (entry.senderId !== senderId) continue;
       // Two replies maximum — the first, and one reminder. After that a
@@ -223,7 +226,12 @@ export function gate(
     return { action: 'pair', code, isResend: false };
   }
 
-  const policy = access.rooms[roomId];
+  // AO6: presence, not truthiness — the same question `assertAllowedRoom` asks
+  // above, so the inbound gate and the outbound gate cannot disagree about
+  // which rooms exist.
+  const policy = Object.prototype.hasOwnProperty.call(access.rooms, roomId)
+    ? access.rooms[roomId]
+    : undefined;
   if (!policy) return { action: 'drop', reason: 'room not enabled' };
 
   const roomAllowFrom = policy.allowFrom ?? [];
@@ -262,7 +270,21 @@ export function commandGate(
  */
 export function assertAllowedRoom(roomId: string, directRoomIds: ReadonlySet<string>): void {
   const access = loadAccess();
-  if (roomId in access.rooms) return;
+  // AO6, twenty-fourth pass. `roomId in access.rooms` walks the PROTOTYPE
+  // chain, and `access.rooms` comes out of `JSON.parse`, so this returned —
+  // i.e. ALLOWED — for `constructor`, `toString`, `valueOf`, `__proto__`,
+  // `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable` and
+  // `toLocaleString`. `roomId` here is whatever the model passed to the tool,
+  // which is precisely the actor this function's own docstring names: "a prompt
+  // injection landing in the session could name any room on the homeserver and
+  // have the bot post there".
+  //
+  // Nothing was ever posted through it — those eight are not room IDs and the
+  // homeserver rejects them — so this is a gate that answered a question it was
+  // never asked rather than a leak. It is still the wrong answer, it is one
+  // operator away from the right one, and `src/command-routing.ts` in the same
+  // package already writes the right one over two tables of its own.
+  if (Object.prototype.hasOwnProperty.call(access.rooms, roomId)) return;
   if (directRoomIds.has(roomId)) return;
   throw new Error(
     `room ${roomId} is not allowlisted — enable it with /prinny room add ${roomId}`

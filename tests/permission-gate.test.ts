@@ -2,6 +2,7 @@
  * The permission gate, and its agreement with the sidecar's reply parser.
  */
 
+import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import { describe, expect, it, loadServerModule } from './harness.ts';
@@ -9,10 +10,12 @@ import {
   APPROVED_COMMAND_KEY,
   describeCall,
   markApproved,
+  namesTool,
   needsApproval,
   newRequestId,
   previewCall,
 } from '../src/permission-gate.ts';
+import { parseSetting } from '../src/config.ts';
 
 const OFF = { permissionMode: 'off' as const, permissionTools: [] };
 const DANGEROUS = { permissionMode: 'dangerous' as const, permissionTools: [] };
@@ -355,5 +358,58 @@ describe('dangerous: a property, not a spelling (AK2)', () => {
       'destroying evidence of what ran',
       'redirecting onto a disk',
     ]);
+  });
+});
+
+describe('AO2 — the always-ask list names a tool, whatever case it was typed in', () => {
+  // `permissionTools` is the one entry in the gate that fires in EVERY mode,
+  // including `off`. It was `.includes(toolName)`, an exact compare, against a
+  // list `parseSetting` accepts unvalidated — and pi's tool names are not one
+  // case: `bash`/`edit`/`write` are lower, `Agent`/`StopAgent`/`AgentStatus`
+  // are not.
+  const listing = (tools: string[]) => ({ permissionMode: 'off' as const, permissionTools: tools });
+
+  it('gates the tool the operator named, in any case, with the mode OFF', () => {
+    for (const typed of ['bash', 'Bash', 'BASH', 'bAsH', ' bash ']) {
+      const decision = needsApproval('bash', { command: 'ls' }, listing([typed]));
+      assert.equal(decision.gate, true, `typed as ${JSON.stringify(typed)}`);
+    }
+  });
+
+  it('the mixed-case tools of this repo are reachable from a lower-case entry', () => {
+    for (const [typed, called] of [
+      ['agent', 'Agent'],
+      ['stopagent', 'StopAgent'],
+      ['AGENTSTATUS', 'AgentStatus'],
+    ] as const) {
+      assert.equal(needsApproval(called, {}, listing([typed])).gate, true, `${typed} → ${called}`);
+    }
+  });
+
+  it('a name that is not on the list is still not gated — folding widens nothing else', () => {
+    assert.equal(needsApproval('read', {}, listing(['bash'])).gate, false);
+    assert.equal(needsApproval('bashful', {}, listing(['bash'])).gate, false);
+    assert.equal(needsApproval('bash', {}, listing([])).gate, false);
+  });
+
+  it('namesTool is the predicate, so the gate and any other reader ask one question', () => {
+    assert.equal(namesTool('Bash', ['bash']), true);
+    assert.equal(namesTool('bash', ['Bash']), true);
+    assert.equal(namesTool('bash', ['write', 'edit']), false);
+    assert.equal(namesTool('bash', []), false);
+  });
+
+  it('the stored list holds one entry per tool, however many spellings were typed', () => {
+    const parsed = parseSetting('permissionTools', 'bash, Bash, BASH, write');
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.ok ? parsed.value : null, ['bash', 'write']);
+  });
+
+  it('control — an exact compare misses every one of those spellings', () => {
+    for (const typed of ['Bash', 'BASH', 'bAsH']) {
+      assert.equal(['bash'].includes(typed), false, typed);
+      // …and that is what the gate used to do.
+      assert.equal([typed].includes('bash'), false, typed);
+    }
   });
 });

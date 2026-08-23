@@ -15,7 +15,7 @@
   "private": true,
   "scripts": {
     "prepare-runtime": "node server/bin/prinny-channel.mjs --prepare",
-    "lint": "for file in extensions/index.ts src/*.ts server/src/*.ts tests/*.test.ts; do node --check \"$file\"; done && node --check server/bin/prinny-channel.mjs",
+    "lint": "for file in extensions/index.ts src/*.ts server/src/*.ts tests/*.test.ts; do node --check \"$file\"; done && for file in server/bin/*.mjs; do node --check \"$file\"; done",
     "test": "node --experimental-strip-types --test --test-timeout=90000 tests/*.test.ts",
     "test:unit": "node --experimental-strip-types --test --test-timeout=90000 --test-skip-pattern=\"extension end to end\" tests/*.test.ts",
     "test:e2e": "node --experimental-strip-types --test --test-timeout=90000 tests/extension-e2e.test.ts"

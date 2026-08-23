@@ -1573,3 +1573,439 @@ reverted.** Probe `y6-the-indicator-a-stopped-channel-left-up.mjs`.
 The sidecar runs from a staged, compiled runtime keyed on a content fingerprint
 of `server/src`, so the next sidecar start restages automatically — but that
 restage does an `npm install` and has not been exercised since AL3.
+
+## Twenty-second pass (AM1) — the stop that could not see the start
+
+`src/channel-lifecycle.ts` is new, and `startChannel`/`stopChannel` are rewritten
+on top of it.
+
+`child` is what a RUNNING channel is. Nothing was what an in-flight START is —
+`child` is assigned on the line AFTER `await instance.start()`:
+
+```js
+   starting = (async () => {
+     try {
+       await instance.start();      // ← everything below is a different turn
+       child = instance;            // ← the FIRST moment a stop can see it
+```
+
+and every line of `stopChannel` reads `child`. So a stop that arrived during the
+handshake found nothing to stop, ran its teardown against an empty channel,
+returned, and the sidecar it could not see published itself afterwards.
+
+**The window is not microseconds.** `src/config.ts`'s own note measures importing
+the built sidecar at **27.5 s in this container**, and sets
+`connectTimeoutSeconds` to **120** because of it. Four callers land in it:
+
+```
+   /prinny stop        answered "channel stopped."   the channel came up anyway
+   /prinny restart     the stop did nothing, AND the start hit
+                       `if (starting) return starting` — so it was handed the
+                       FIRST start's promise and reported that one's outcome as
+                       its own. Nothing restarted.
+   /prinny configure   the same shape, and this is the command whose whole job is
+                       to REPLACE the credentials the in-flight start is using.
+   session_shutdown    returned in milliseconds and left a sidecar logging into
+                       Matrix for a session that had ended.
+```
+
+A disowned sidecar is not inert: it opens the Olm crypto store, which
+`server/src/state.ts` says "must never be shared between two running bots". So
+the `/prinny restart` that appeared to do nothing was the one that produced two.
+
+**The rule.** A start captures a token; a stop moves it. The start re-reads the
+token after every await and refuses to publish itself when it has moved. Same
+mechanism `vendor/pi-loop-mode` calls `runToken`, written down rather than left
+implicit in two functions ninety lines apart.
+
+A stop does not merely disown: it holds the in-flight instance and **ends it**.
+Waiting was the other option and it is the wrong one — the handshake's budget is
+two minutes and a `session_shutdown` that blocked for two minutes would be worse
+than the bug. `McpChild.stop()` is bounded (SIGTERM, SIGKILL after 5 s) and calls
+`failPending`, which rejects the in-flight `initialize`, so the start's own catch
+runs at once instead of sitting out its timeout.
+
+**Extracted rather than kept as three `let`s**, for the reason
+`server/src/connect.ts` was extracted for AL3: `extensions/index.ts` imports
+`@earendil-works/pi-tui`, `@earendil-works/pi-ai` and `typebox` at runtime, none
+of which resolve under the bare `node --experimental-strip-types --test` this
+suite runs on — which is why six suites in `tests/` assert on that file's SOURCE
+TEXT. This is the same move on the other side of the pipe.
+
+`/prinny status` gained a third state on the way. A start in flight used to draw
+as "not running", which is the honest-looking answer at exactly the moment the
+operator is most likely to ask.
+
+**Tests.** `tests/channel-lifecycle.test.ts`, 10 tests. **6 of 10 fail with the
+fix reverted**, and the four that pass are the controls. Probe
+`z1-the-stop-that-could-not-see-the-start.mjs`, four modes.
+
+## Twenty-second pass — the tests
+
+**473, up from 463.** Lint clean.
+
+`/prinny prepare` still has not been re-run since AL3, and AM1 changed the code
+around the start it feeds.
+
+---
+
+# Twenty-third pass (2026-08-23) — what we wrote down, and who reads it back
+
+Full write-up: `context/design/subagents-loop-verifier-round-trips.md`. The axis:
+**for every value this package puts outside its own heap, name the writer, the
+reader, and what the reader does when the bytes are absent, malformed, stale or
+from a different world than the writer's.** Three of the pass's seven findings
+are here, and this package has more of them than any other for a structural
+reason: it is the only one with a second process, a staged build and a state
+directory two writers share.
+
+## AN2 — the runtime three readers called "built"
+
+The sidecar runs from a staged, compiled copy of `server/src` in
+`~/.pi/agent/channels/prinny/runtime`, keyed on a content fingerprint of the
+source plus three build files. `server/bin/prinny-channel.mjs` decides "prepared"
+as `existsSync(ENTRY) && stampMatches(sourceFingerprint())`. Three other readers
+— `startupBlocker()`, `/prinny status`, `/prinny configure` — and
+`scripts/pi-local.sh`'s launch line asked `existsSync(dist/server.js)` alone, and
+those four are the ones that talk to the operator.
+
+**Measured on this box while the finding was written:**
+
+```
+   .source-stamp                     f297f2b6…   staged 2026-08-22 14:43
+   fingerprint of server/src now     53371dab…
+   staged src/ vs the checkout       connect.ts MISSING, server.ts differs
+   `prinny-channel.mjs --staged`     stale (exit 1)
+```
+
+`connect.ts` is AL3 — the twenty-first pass's fix for a connect loop that builds
+one matrix-js-sdk client per failed attempt and stops none of them, on one Olm
+crypto store this package's own `state.ts` says must never be shared. **It has
+never run.** Every reader said "built".
+
+**Why "the next start restages it" is the problem rather than the answer.** It
+does restage, inside the connect budget: `npm install` plus `tsc` is about a
+minute, `connectTimeoutSeconds` is 120, and importing the built sidecar alone
+costs a measured 27.5 s. The bootstrap's own header names that failure and says
+`--prepare` exists to keep the operator out of it.
+
+**Why the weaker question was written three times.** Because the right one was
+unreachable: `prinny-channel.mjs` bootstraps at import — it stages, compiles and
+then `await import`s the server — so nothing can ask it anything.
+
+**The fix.** `server/bin/runtime-stamp.mjs`: node built-ins only, exports only,
+runs nothing. `sourceFingerprint` is unchanged down to the `localeCompare` sort,
+so existing `.source-stamp` files keep meaning what they meant. `stagedState`
+returns `absent | stale | current`, and a build with **no stamp at all** is
+`stale` rather than `current` — there is no evidence it matches. The bootstrap
+imports it and drops its own copies; the extension uses it in all three places
+and blocks a start on `stale` with its own sentence; `scripts/pi-local.sh` calls
+`prinny-channel.mjs --staged`, which prints one word and exits 0 / 1 / 2.
+
+**Tests.** `tests/runtime-stamp.test.ts`, 18 tests. **Control run: 2 of 18 fail
+with the extension reverted to `existsSync`.** Probe
+`aa2-the-runtime-three-readers-called-built.mjs`, three modes — `live` is the
+finding rather than an illustration of it.
+
+Two existing suites changed with it: `extension-e2e` and `tool-budget` stamp
+their fake runtimes with the real fingerprint, because a compiled entry is no
+longer enough and the check is part of what is under test.
+
+## AN1 — the settings file that reset the permission gate
+
+`readSettings`' own docstring promises
+
+> Anything malformed falls back to the default for that key alone; a typo in one
+> setting must not silently reset the rest, **because the rest includes the
+> permission mode**.
+
+True of a bad VALUE — `asEnum` and `asPositiveInt` are per key. False of a bad
+FILE, which is the likelier typo in hand-edited JSON: `JSON.parse` throws, `raw`
+stays `{}`, every key falls to its default, and `permissionMode` goes from `all`
+to `off`. The Matrix approval relay, off, silently. Then `/prinny set` writes
+those defaults over the file.
+
+**The control is in this package**, one directory down:
+`server/src/access.ts` quarantines `access.json` — *"Quarantine rather than
+delete: it may be a hand-edit the user wants back, and starting from defaults
+beats refusing to run."*
+
+**The fix.** `src/json-store.ts` — the same three functions as
+`vendor/pi-subagents-lite/src/config/json-store.ts`, written twice because vendor
+packages here do not import each other, with `tests/json-store.test.ts` driving
+both copies over the same cases. `readSettingsLayer` says which kind of nothing
+it found; `writeSettings` quarantines before replacing a file it could not read;
+`/prinny status` prints a `settings: UNREADABLE (…) — running on DEFAULTS,
+permissionMode off` line, because that is where somebody looks when the channel
+is not behaving as configured.
+
+**Tests.** 12 tests. **Control run: 1 of 12 fails with the quarantine removed;
+1 of 12 with the other package's read reverted.** Probe `aa1 prinny`.
+
+## AN3 — the device id a new token inherited
+
+`/prinny configure token <t>` wrote `{ PRINNY_ACCESS_TOKEN: token }` and left
+`PRINNY_DEVICE_ID` behind. A token belongs to a DEVICE, and `resolveDeviceId`
+reads the stored id FIRST:
+
+```js
+   if (creds.deviceId) return creds.deviceId;      // ← never asks
+```
+
+So the command's own reply — *"The channel resolves the matching device ID from
+/account/whoami on its next start"* — is false in the normal case, and the bot
+builds a Rust-crypto client claiming to be the old device while the homeserver
+considers the token to be a new one. `server/src/state.ts` names the symptom in
+its own words: a bot that *"will appear to ignore people in encrypted rooms"*,
+with nothing in the log.
+
+**And the skipped lookup is also the identity check.** `resolveDeviceId`'s whoami
+call is where a token belonging to a different account is caught
+(`the access token belongs to X, not PRINNY_USER_ID`). Short-circuited, that does
+not run either.
+
+**The control is forty lines below, in the other arm of the same command.** The
+three-argument `configure` clears both keys on an account switch, under the
+comment *"the stored token and device belong to the old one and would be used in
+preference to this password."*
+
+**The fix.** `credentialUpdatesForToken()` in `src/config.ts` returns
+`{ PRINNY_ACCESS_TOKEN: token, PRINNY_DEVICE_ID: null }` — `null` is
+`updateEnv`'s delete — with the reasoning in its docstring, and the reply
+rewritten to say what actually happens.
+
+**Tests.** `tests/token-device-id.test.ts`, 8 tests, two of which pin
+`resolveDeviceId`'s precedence in `server/src` so the coupling that makes the
+clear load-bearing is written down. **Control run: 2 of 8 fail.** Probe
+`aa3-the-device-id-a-new-token-inherited.mjs`, three modes.
+
+## Recorded and left open
+
+- **`access.json` and `.env` each have two writers in two processes**, both
+  read-modify-write. The windows are microseconds inside synchronous functions;
+  the repair would be a lock file, and the honest position is to notice a lost
+  token rather than to prevent it.
+- **The sidecar's `readAccessFile` rebuilds from a fixed key list**, so a key it
+  does not know is dropped on the next pairing. That is why `pi.json` exists as a
+  separate file, and `src/config.ts` says so where `SETTINGS_FILE` is declared.
+  Both `Access` type declarations currently match, checked this pass.
+
+## Twenty-third pass — the tests
+
+**511, up from 473.** The lint script now checks every `server/bin/*.mjs` rather
+than `prinny-channel.mjs` alone, because there are two of them.
+
+One existing test moved with the code: AK1's regression suite asserted that
+`ensureToolsRegistered(api)` appears before `await startChannel()` *within 400
+characters*, and AN2's five lines of comment pushed the second one out of the
+window — a test of an invariant that still held, reporting it broken. It now
+asserts the order over the whole file. The invariant is "in this order", and a
+byte distance is not that.
+
+## AO2 — the always-ask list that names a tool the gate does not know
+
+`permissionTools` gates a tool **whatever the mode says**, and
+`src/permission-gate.ts` says why: *"An explicitly listed tool is gated whatever
+the mode says — including when the mode is `off`, because naming a tool is a more
+specific instruction than choosing a mode."* It is therefore the one entry in
+`needsApproval` that can be the ONLY gate in force.
+
+It was matched with `settings.permissionTools.includes(toolName)` — an exact
+compare — against a list `parseSetting` stores unvalidated: split on commas,
+trim, keep. Every other setting in that switch is checked against its enum, and
+every other allowlist in this package validates its entries **and says why**
+(`MXID_RE`: *"A bare localpart in the allowlist silently matches nobody"*;
+`ROOM_ID_RE`: *"an alias moves between rooms, an ID does not"*). The list of TOOL
+names had neither.
+
+Tool names in this stack are not one case: pi's built-ins are lower (`bash`,
+`edit`, `write`), this repo's own are not (`Agent`, `StopAgent`, `AgentStatus`).
+So `/prinny set permissionTools Bash` is stored, echoed back, and gates nothing —
+and it fails silently in both directions, because a gate that never fires looks
+exactly like a gate the operator configured correctly.
+
+**Why the repair is at the comparison.** There is no tool registry on
+`ExtensionContext` — pi exposes `ui`, `mode`, `cwd`, `sessionManager`,
+`modelRegistry`, `model`, `scopedModels`, `thinkingLevel` and the lifecycle calls
+and nothing that lists tools — so `parseSetting` cannot check a name against the
+real set at the moment it is typed.
+
+**The fix.** `namesTool(toolName, list)` folds case and trims on both sides.
+Folding is the `ask` direction, which is this module's own stated rule — *"The
+direction of every judgement call below is ask, never skip"* — and two tools
+differing only by case would both gate, which is the same direction again.
+`parseSetting` de-duplicates by the same question the gate asks, keeping the
+operator's own spelling, so the stored list's length stays a true claim about how
+many tools are gated. `/prinny set`'s help line says the matching ignores case.
+
+**Tests.** `tests/permission-gate.test.ts`, 40 tests. **Control run: 3 of 40 fail
+with `namesTool` reverted to `.includes`.** Probe
+`ab2-the-tool-the-gate-never-recognised.mjs`, three modes.
+
+## AO3 — the room pi consumed, identified by a string two rooms can produce
+
+`markLive`'s docstring said *"Matching is on the Matrix event ID, which is unique
+and appears in the block as an attribute"*. That stopped being true when the
+`<channel …>` block was replaced by the one-line `[matrix]` marker:
+`blockMatches` is `userMessageText.trim() === entry.injected.trim()` — the whole
+rendered string — and `renderInboundMessage` deliberately drops `room_id`,
+`message_id`, `user_id` and, in a DM, `from=` as well.
+
+```
+   two DMs, two senders, one word        both render as   "[matrix] hi"
+```
+
+**Why that is a leak.** One echo then matches BOTH entries — the loop has no
+`break` — so `liveRooms().length === 2` and `forwardToMatrix` refuses. The person
+pi actually took a message from gets no answer, and both rooms are told somebody
+else was being answered. `markLive`'s own docstring names what is at stake: *"the
+current turn's answer, about the operator's private local work, would be
+forwarded to whoever just messaged. Nobody would see that happen from this
+side."*
+
+**The fix.** `uniqueInjection(message, outstanding)` in `src/inbound.ts`: plain ▸
+name the sender ▸ an opaque `#n`, against the other outstanding non-live entries.
+Zero tokens unless a collision was about to happen, and the first widening is
+`from=`, which is information the model can use rather than a disambiguator it
+cannot. `is_direct` is the sidecar's own flag, so a sender cannot suppress their
+own name by choosing a display name that looks like one.
+`outstandingInjections(room)` excludes exactly what `markLive` excludes, so the
+two cannot disagree about what is outstanding. `markLive`'s docstring now says
+what it matches on.
+
+**Tests.** `tests/inbound.test.ts`, 33 tests. **Control run: 4 of 33 fail with
+`uniqueInjection` reduced to `renderInboundMessage`.** Probe
+`ab3-two-rooms-one-sentence.mjs`, three modes.
+
+## AO4 — the instant that stood in for the message
+
+`enqueue` dropped anything with `ts <= watermark`, under a docstring reading
+*"Everything at or below this has been seen"* — a claim about IDENTITY made out
+of a claim about TIME. `origin_server_ts` is set by the SENDER's homeserver: two
+rooms are two clocks, federation delivers out of order, and two events share a
+millisecond freely.
+
+`handleInbound` reads that `false` as *"Already delivered on an earlier run"* and
+returns — **after** the acknowledging reaction has been sent. The bot reacts and
+then never answers, which is the exact failure the outbox exists to prevent,
+reached through the outbox.
+
+**The fix.** `Watermark = { ts, ids }`; `alreadyDelivered()` asks the event ID
+above a `CLOCK_SKEW_MS` (5 min) horizon and the timestamp below it;
+`MAX_REMEMBERED_IDS` is 200. The timestamp still bounds the catch-up, which is
+the job it was written for. `buildBot`'s `catchUpFrom` is lowered by the horizon,
+because an event the floor excludes never reaches `enqueue` at all — and
+everything it lets back in is decided by event id there. A pre-pass `{ ts }` file
+reads as a mark with no ids, which is the old behaviour below the horizon and the
+new one above it.
+
+**Tests.** `tests/queue.test.ts`, 22 tests. Four of them are new and replace one
+that pinned the defect: *"refuses anything already delivered"* asserted that a
+message **nobody had ever delivered** is refused, because it carried an earlier
+timestamp than one that was. It passed for exactly the reason the code was wrong.
+**Control run: 2 of 22 fail with `alreadyDelivered` reduced to `ts <=
+watermark.ts`.** Probe `ab4-the-instant-that-stood-for-the-message.mjs`, four
+modes.
+
+## AO5 — the suite was green about a program not in the tree
+
+`tests/harness.ts`'s `loadServerModule` imports the staged COMPILED sidecar and
+calls that a benefit: *"testing the artifact that actually ships rather than a
+re-compile of it."* True exactly while the stage IS this checkout, and nothing
+asked. AN2 built `stagedState()` for this question and converted four readers;
+**the harness is the fifth, and the only one whose wrong answer is silent — a
+stale runtime does not fail a suite, it passes one.**
+
+Measured live when the finding was written: stamp `f297f2b6…`, `server/src`
+hashing to `94b4a2f9…`, **no `connect.js` in `dist/` at all**, and 511 tests
+passing — 116 suites against a build without AL3's connect-loop fix.
+
+**The fix.** `assertRuntimeMatchesSource()`, called from **every**
+`loadServerModule` rather than once at load: a `--prepare` in another terminal is
+exactly the thing that changes the answer mid-run. Hard failure naming the
+command, with a different sentence for `stale` and for `absent`. Refusing is the
+only honest option — skipping would report a suite as passing that never ran, and
+compiling from here would need the staged `node_modules` and turn a test run into
+a build.
+
+**The consequence.** Any change under `server/src/` needs a `--prepare` before
+its tests mean anything (~45 s). That was always true; the suite now says so.
+
+**Tests.** `tests/runtime-stamp.test.ts`, 23 tests. **Control run: 1 of 23 fails
+with the assertion removed** — there is exactly one thing to assert, and the
+other twenty-two are about `stagedState()` itself. Probe
+`ab5-the-program-the-suite-was-testing.mjs`, three modes.
+
+## AO6 — four lookups that answered for a key nobody stored
+
+`access.pending[code]` in `pair` and `deny`, `access.rooms[roomId]` in
+`removeRoom`, and `roomId in access.rooms` in the sidecar's `assertAllowedRoom` —
+all over `JSON.parse` output, so all eight inherited names (`constructor`,
+`toString`, `valueOf`, `hasOwnProperty`, `__proto__`, `isPrototypeOf`,
+`propertyIsEnumerable`, `toLocaleString`) are reachable and truthy.
+
+```
+   /prinny pair constructor  → "paired undefined. They can now reach this
+                                session."  — and `null` in the allowlist
+   deny / removeRoom         → reported removing all eight
+   assertAllowedRoom         → ALLOW for all eight
+```
+
+The gate is the one with the actor named: its docstring says *"a prompt injection
+landing in the session could name any room on the homeserver and have the bot
+post there"*, and the `roomId` it tests is whatever the MODEL passed to the tool.
+**Not exploitable** — none of the eight is a room ID and the homeserver rejects
+them — and still a gate whose answer did not mean what it said.
+
+**The control was already in the package.** `src/command-routing.ts`, nine files
+over, writes `Object.prototype.hasOwnProperty.call` over two tables of its own,
+against a `name` that arrives in a Matrix message. The sidecar's own pairing loop
+uses `Object.entries`, which is own-keys-only, and is why the symptom only ever
+showed on the extension side.
+
+**The fix.** `hasEntry()` in `src/access-store.ts` for `pair`/`deny`/
+`removeRoom`; `hasOwnProperty.call` in the sidecar's `assertAllowedRoom` **and**
+in `gate()`'s room lookup, so the inbound gate and the outbound gate cannot
+disagree about which rooms exist. `.call` rather than `Object.hasOwn` so both
+halves of the package say it the same way and one grep finds all five.
+
+**Tests.** `tests/access-store.test.ts`, 35 tests. **Control run: 5 of 35 fail
+with `hasEntry` reduced to truthiness.** Probe `ab6-the-key-nobody-stored.mjs`,
+three modes.
+
+## AO7 — four spellings of one directory, and the tilde nobody expanded
+
+All four readers of `PI_CODING_AGENT_DIR` in this package — `src/config.ts`,
+`server/src/state.ts`, `server/bin/prinny-channel.mjs` and `tests/harness.ts` —
+wrote `env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')`, while pi's
+own `getAgentDir()` runs the value through `expandTildePath` first.
+
+`PI_CODING_AGENT_DIR=~/pi-work` is an ordinary thing to write in a shell profile
+or an `.env`, and no shell expands it when it is quoted or read out of a file. pi
+then keeps its files in `$HOME/pi-work` and this package keeps **the allowlist,
+the credentials and the Olm store** in a directory literally named `~`, relative
+to whatever the cwd was — so a second session started somewhere else gets a
+second empty one. Everything works, and the bot has no allowlist and no keys.
+
+**The fix.** `server/bin/agent-dir.mjs` — new, with the tilde rule read out of
+pi's `normalizePath` rather than guessed, down to the backslash form being
+win32-only — used by `src/config.ts`, the bootstrap and the harness.
+`server/src/state.ts` keeps a **deliberate** duplicate: it is compiled with
+`rootDir: src` into a runtime outside the repo and cannot import the helper. Both
+copies are compared by a test, the arrangement the compaction lock and
+`json-store.ts` already use here.
+
+**The scan, not the fifth fix.** `tests/config.test.ts` walks every `.ts`/`.mjs`
+in the package (skipping `tests/`, `dist/`, `node_modules/`) and fails if any
+file but those two names `PI_CODING_AGENT_DIR`; plus a test that drives **both
+packages' copies** over six values and asserts one answer each.
+
+**Tests.** `tests/config.test.ts`. **Control run: 2 of 15 fail in
+`pi-subagents-lite`'s matching suite with the tilde expansion removed.** Probe
+`ab7-the-directory-two-packages-disagreed-about.mjs`, four modes.
+
+## Twenty-fourth pass — the tests
+
+**550, up from 511.** And they now refuse to run at all against a staged runtime
+that is not this checkout (AO5), so the number is a statement about the sidecar
+in the tree rather than about whatever was last compiled.

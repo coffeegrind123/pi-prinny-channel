@@ -74,17 +74,25 @@ import * as store from '../src/access-store.ts';
 import {
   DEFAULT_SETTINGS,
   ENV_FILE,
+  credentialUpdatesForToken,
   LOG_FILE,
-  RUNTIME_ENTRY,
+  RUNTIME_DIR,
+  SETTINGS_FILE,
   SETTING_KEYS,
   STATE_DIR,
   ensureStateDir,
   isConfigured,
   parseSetting,
   readSettings,
+  readSettingsLayer,
   writeSettings,
   type PiSettings,
 } from '../src/config.ts';
+// AN2: the same question the bootstrap asks. `runtime-stamp.mjs` has no side
+// effects and imports node built-ins only, so both sides can ask it; the
+// bootstrap itself stages and imports the server at load, which is why this used
+// to be an `existsSync` on the compiled entry instead.
+import { stagedState } from '../server/bin/runtime-stamp.mjs';
 import {
   SentRegistry,
   assistantTextOfMessage,
@@ -94,6 +102,7 @@ import {
   resolveActionRoom,
 } from '../src/forwarding.ts';
 import { beginCompaction, compactionInFlight, endCompaction, PRINNY_OWNER } from '../src/compaction-lock.ts';
+import { ChannelLifecycle } from '../src/channel-lifecycle.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
 import {
   abandonedCompactionMessage,
@@ -119,7 +128,7 @@ import {
   undeliveredRooms,
   type UnansweredReason,
 } from '../src/delivery.ts';
-import { renderInboundMessage, roomOf, type ChannelMessage } from '../src/inbound.ts';
+import { renderInboundMessage, roomOf, uniqueInjection, type ChannelMessage } from '../src/inbound.ts';
 import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
 import {
@@ -143,6 +152,24 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
  */
 const SIDECAR_ENTRY =
   process.env.PRINNY_SIDECAR_ENTRY ?? join(PACKAGE_ROOT, 'server', 'bin', 'prinny-channel.mjs');
+
+/** The source tree the staged runtime is built from. */
+const PAYLOAD_ROOT = join(PACKAGE_ROOT, 'server');
+
+/**
+ * `absent` | `stale` | `current` — AN2.
+ *
+ * Never throws: a question about the filesystem must not be the reason a command
+ * handler dies. An unanswerable question reads as `absent`, which is the state
+ * whose advice (`/prinny prepare`) is right either way.
+ */
+function runtimeState(): 'absent' | 'stale' | 'current' {
+  try {
+    return stagedState(RUNTIME_DIR, PAYLOAD_ROOT);
+  } catch {
+    return 'absent';
+  }
+}
 
 const CLIENT_NAME = 'pi-prinny-channel';
 const CLIENT_VERSION = '0.1.0';
@@ -168,7 +195,20 @@ const DELIVERY_SWEEP_MS = DELIVERY_GRACE_MS / 2;
 
 let child: McpChild | null = null;
 let settings: PiSettings = DEFAULT_SETTINGS;
-let starting: Promise<void> | null = null;
+/**
+ * Who owns the sidecar between "start it" and "it is up" (AM1).
+ *
+ * `child` is what a RUNNING channel is. This is what an in-flight START is, and
+ * until the twenty-second pass there was nothing that was: `child` is assigned
+ * on the line after the handshake, so for the whole of it — measured at 27.5 s
+ * for the import alone, with a 120 s budget — a stop had nothing to stop.
+ *
+ * Extracted rather than kept as three `let`s here, for the same reason
+ * `server/src/connect.ts` was: this file cannot be loaded by the suite, and
+ * the ordering rule is the whole of what went wrong. See
+ * `../src/channel-lifecycle.ts`.
+ */
+const lifecycle = new ChannelLifecycle<McpChild>();
 let connected = false;
 /** Last error worth showing the user, so `/prinny status` can repeat it. */
 let lastError: string | undefined;
@@ -303,11 +343,26 @@ function startupBlocker(): string | undefined {
       '  /prinny configure <homeserver> <user-id> <password>'
     );
   }
-  if (!existsSync(RUNTIME_ENTRY)) {
+  const runtime = runtimeState();
+  if (runtime === 'absent') {
     return (
       'the channel runtime has not been built yet. Run:\n' +
       '  /prinny prepare\n' +
       'It installs and compiles the Matrix layer and takes about a minute, once.'
+    );
+  }
+  // AN2: a runtime built from source that has since changed is not ready
+  // either, and starting anyway is the failure `--prepare` exists to prevent —
+  // the sidecar would re-stage inside the connect budget (about a minute of
+  // `npm install` and `tsc` against a 120s handshake that already spends 27.5s
+  // importing the Matrix stack) and report `initialize timed out`, which reads
+  // as a broken channel rather than a rebuild.
+  if (runtime === 'stale') {
+    return (
+      'the channel runtime was built from a different version of the sources. Run:\n' +
+      '  /prinny prepare\n' +
+      'Starting without it would rebuild inside the connect timeout and look like a channel\n' +
+      'that never comes up. It takes about a minute.'
     );
   }
   return undefined;
@@ -315,56 +370,81 @@ function startupBlocker(): string | undefined {
 
 async function startChannel(): Promise<void> {
   if (child?.running) return;
-  if (starting) return starting;
+  if (lifecycle.starting) return lifecycle.start(startHooks());
 
   const blocker = startupBlocker();
   if (blocker) {
     lastError = blocker;
-    setStatus('prinny: not configured');
+    // AN2: three blockers now, and the pill said "not configured" for all of
+    // them. An operator reading it while the credentials are fine goes looking
+    // in the wrong place — which is the same failure one layer up, since the
+    // whole finding is a reader answering a question it was not asked.
+    setStatus(
+      isConfigured()
+        ? runtimeState() === 'stale'
+          ? 'prinny: runtime stale — /prinny prepare'
+          : 'prinny: runtime not built — /prinny prepare'
+        : 'prinny: not configured'
+    );
     notify(blocker, 'warning');
     return;
   }
 
   settings = readSettings();
+  return lifecycle.start(startHooks());
+}
 
-  const instance = new McpChild({
-    command: process.execPath,
-    args: [SIDECAR_ENTRY],
-    cwd: PACKAGE_ROOT,
-    connectTimeoutMs: settings.connectTimeoutSeconds * 1_000,
-    requestTimeoutMs: settings.requestTimeoutSeconds * 1_000,
-    clientName: CLIENT_NAME,
-    clientVersion: CLIENT_VERSION,
-    onStderr: (line) => {
-      log(`[sidecar] ${line.trimEnd()}`);
-      const verdict = classifyChildLine(line);
-      if (!verdict) return;
-      if (/connected as /.test(line)) {
-        connected = true;
-        lastError = undefined;
-        setStatus('prinny: connected');
-      }
-      notify(line.trim(), verdict.level);
-    },
-    onExit: (code, signal) => {
-      connected = false;
-      setStatus('prinny: stopped');
-      log(`sidecar exited (code ${code}, signal ${signal})`);
-      // Deliberately not restarted here. The sidecar retries the *homeserver*
-      // forever on its own, so an exit means something a restart loop cannot
-      // fix — bad credentials, a broken build, a killed process. Looping on
-      // that would spawn a process a second and fill the log with the same
-      // line. `/prinny start` is the retry.
-      if (!shuttingDown) {
-        notify('the Matrix channel stopped. Restart it with /prinny start', 'error');
-      }
-    },
-    onNotification: handleNotification,
-  });
+/**
+ * One start, minus the arbitration — which is `../src/channel-lifecycle.ts`'s
+ * (AM1).
+ *
+ * `build` runs synchronously and `open` is the handshake, and the split is the
+ * whole point: from the moment `build` returns there is a child process that a
+ * stop has to be able to END, and until this pass there was no handle on it
+ * outside this function's own local. See that module's header for the four
+ * callers that landed in the gap.
+ */
+function startHooks() {
+  return {
+    build: () =>
+      new McpChild({
+        command: process.execPath,
+        args: [SIDECAR_ENTRY],
+        cwd: PACKAGE_ROOT,
+        connectTimeoutMs: settings.connectTimeoutSeconds * 1_000,
+        requestTimeoutMs: settings.requestTimeoutSeconds * 1_000,
+        clientName: CLIENT_NAME,
+        clientVersion: CLIENT_VERSION,
+        onStderr: (line) => {
+          log(`[sidecar] ${line.trimEnd()}`);
+          const verdict = classifyChildLine(line);
+          if (!verdict) return;
+          if (/connected as /.test(line)) {
+            connected = true;
+            lastError = undefined;
+            setStatus('prinny: connected');
+          }
+          notify(line.trim(), verdict.level);
+        },
+        onExit: (code, signal) => {
+          connected = false;
+          setStatus('prinny: stopped');
+          log(`sidecar exited (code ${code}, signal ${signal})`);
+          // Deliberately not restarted here. The sidecar retries the *homeserver*
+          // forever on its own, so an exit means something a restart loop cannot
+          // fix — bad credentials, a broken build, a killed process. Looping on
+          // that would spawn a process a second and fill the log with the same
+          // line. `/prinny start` is the retry.
+          if (!shuttingDown) {
+            notify('the Matrix channel stopped. Restart it with /prinny start', 'error');
+          }
+        },
+        onNotification: handleNotification,
+      }),
 
-  starting = (async () => {
-    try {
-      await instance.start();
+    open: (instance: McpChild) => instance.start(),
+
+    publish: (instance: McpChild) => {
       child = instance;
       lastError = undefined;
       setStatus('prinny: starting');
@@ -382,25 +462,50 @@ async function startChannel(): Promise<void> {
           );
         }
       }, CONNECT_REPORT_MS).unref?.();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+    },
+
+    fail: (_instance: McpChild, error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
       lastError = message;
       setStatus('prinny: failed');
       notify(`could not start the Matrix channel: ${message}`, 'error');
-      await instance.stop().catch(() => undefined);
       child = null;
-    } finally {
-      starting = null;
-    }
-  })();
+    },
 
-  return starting;
+    // AM1: a start the operator stopped did not FAIL, and every line of `fail`
+    // above is a claim about this instance being the current one. `lastError` is
+    // what `/prinny status` repeats and `requireChannel()` quotes, and
+    // `child = null` would drop a sidecar a LATER `/prinny start` has already
+    // published — which is the ordinary shape of `/prinny restart` issued while
+    // the first sidecar is still handshaking.
+    disowned: (_instance: McpChild, error?: unknown) => {
+      const why = error instanceof Error ? `: ${error.message}` : error !== undefined ? `: ${String(error)}` : '';
+      log(`the channel was stopped while it was starting${why}`);
+    },
+  };
 }
 
 let shuttingDown = false;
 
 async function stopChannel(): Promise<void> {
-  // AI2: FIRST, while the sidecar is still reachable. A deferred `/compact` was
+  // AM1: FIRST, and before anything that can await. Every line below reads
+  // `child`, which is null for the whole of a start's handshake — so without
+  // this a stop that landed in that window returned having done nothing, and
+  // the sidecar it could not see published itself a minute later.
+  //
+  // Not awaited here: `cancel()` ends the in-flight start, and ending it has to
+  // happen while the two calls below can still reach a sidecar. The await is at
+  // the bottom, with the other one.
+  //
+  // `shuttingDown` goes up FIRST, above the cancel, because `cancel()` sends the
+  // in-flight sidecar a SIGTERM and its `onExit` reads this flag to decide
+  // whether to tell the operator the channel "stopped" unexpectedly. Nothing
+  // between here and the assignment below awaits, so today the order does not
+  // matter — which is exactly the kind of thing this pass is about, so it is
+  // stated instead of relied on.
+  shuttingDown = true;
+  const cancelled = lifecycle.cancel();
+  // AI2: while the sidecar is still reachable. A deferred `/compact` was
   // answered with "I will compact as soon as it finishes" and then dropped here
   // in silence, a few lines above a loop that exists because a pending decision
   // must not evaporate. `callSidecar` goes through `requireChannel()`, which
@@ -416,7 +521,6 @@ async function stopChannel(): Promise<void> {
   // intervals in this file, both `unref`'d, both with nothing to do once the
   // sidecar is gone, and only one of them was stopped here.
   stopTyping();
-  shuttingDown = true;
   const instance = child;
   child = null;
   connected = false;
@@ -439,6 +543,11 @@ async function stopChannel(): Promise<void> {
     log('stopping the sidecar');
     await instance.stop().catch(() => undefined);
   }
+  // AM1: the start that was still handshaking, ended rather than waited for —
+  // and awaited here so `/prinny restart` and `/prinny configure`, which are
+  // `stop` then `start` in two statements, cannot have the second race the
+  // first. Bounded: see `channel-lifecycle.ts`.
+  await cancelled;
   shuttingDown = false;
 }
 
@@ -493,10 +602,35 @@ let api: ExtensionAPI | null = null;
  */
 let lastInbound: { room?: string; messageId?: string } = {};
 
+/**
+ * The `injected` text of every room still waiting on an answer, except this one.
+ *
+ * AO3: what `markLive` matches on, and therefore what has to be unique across
+ * the rooms outstanding at the same moment. A room's OWN previous entry is
+ * excluded — `mergeAwaiting` replaces it, so it is not something a later echo
+ * can be confused with.
+ */
+function outstandingInjections(exceptRoom: string | undefined): string[] {
+  const texts: string[] = [];
+  for (const [room, entry] of awaitingReply) {
+    if (room === exceptRoom) continue;
+    // `live` is the only exclusion, because it is the only one `markLive`
+    // makes: an `answered` entry that is not live still has its `injected` text
+    // compared against every echo, so a new message that renders identically to
+    // it would mark it live — a room pi took nothing from, added to
+    // `liveRooms()`, which is what suppresses the answer to the room that asked.
+    if (entry.live) continue;
+    if (entry.injected) texts.push(entry.injected);
+  }
+  return texts;
+}
+
 function deliverInbound(message: ChannelMessage): void {
   if (!api) return;
   const room = roomOf(message);
-  const text = renderInboundMessage(message);
+  // AO3: a rendering no other outstanding room could have produced. Identical
+  // in the ordinary case; see `uniqueInjection`.
+  const text = uniqueInjection(message, outstandingInjections(room));
   log(`inbound from ${message.meta?.user_id ?? 'unknown'} in ${room ?? 'unknown room'}`);
 
   lastInbound = { room, messageId: message.meta?.message_id };
@@ -797,9 +931,26 @@ let unattributableThisRun = false;
  * messaged. Nobody would see that happen from this side.
  *
  * So eligibility is tied to evidence rather than to timing: the room is marked
- * live when its own `<channel>` block shows up as a user message, which is pi
- * saying it has consumed it. Matching is on the Matrix event ID, which is
- * unique and appears in the block as an attribute.
+ * live when its own injected text shows up as a user message, which is pi
+ * saying it has consumed it.
+ *
+ * ## What it matches on, and what it used to say it matched on (AO3)
+ *
+ * This paragraph used to read *"Matching is on the Matrix event ID, which is
+ * unique and appears in the block as an attribute"*. That was true of the
+ * `<channel …>` block and stopped being true when the block was replaced by the
+ * one-line `[matrix]` marker: `renderInboundMessage` drops `room_id`,
+ * `message_id` and `user_id` deliberately, and `blockMatches` is now
+ * `userMessageText.trim() === entry.injected.trim()` — the whole rendered
+ * string, with no identifier in it at all.
+ *
+ * That string is not unique. Two direct messages from two senders saying the
+ * same word both render as `[matrix] hi`, because a DM does not carry `from=`
+ * either. `uniqueInjection` is what makes the thing being matched on actually
+ * identify one room again; the widening it does costs nothing unless a
+ * collision was about to happen. The loop below is unchanged, and with unique
+ * texts its "first non-live entry that matches" is the right entry rather than
+ * an arbitrary one.
  */
 function markLive(userMessageText: string): void {
   for (const [room, entry] of awaitingReply) {
@@ -1533,16 +1684,46 @@ function formatStatus(): string {
   lines.push('prinny — Matrix channel for pi');
   lines.push('');
 
+  // AM1: a start in flight is a third state, and `/prinny status` used to draw
+  // it as the first. The handshake is up to two minutes (see
+  // `../src/channel-lifecycle.ts`), so "not running" was the honest-looking
+  // answer at exactly the moment the operator was most likely to ask.
   const state = !child?.running
-    ? lastError
-      ? `not running — ${lastError.split('\n')[0]}`
-      : 'not running'
+    ? lifecycle.starting
+      ? 'starting (sidecar handshake in progress)'
+      : lastError
+        ? `not running — ${lastError.split('\n')[0]}`
+        : 'not running'
     : connected
       ? 'connected'
       : 'starting (Matrix login in progress)';
   lines.push(`  channel:      ${state}`);
   lines.push(`  credentials:  ${isConfigured() ? `set in ${ENV_FILE}` : 'not configured'}`);
-  lines.push(`  runtime:      ${existsSync(RUNTIME_ENTRY) ? 'built' : 'NOT BUILT — run /prinny prepare'}`);
+  // AN1: the settings file exists and could not be read, so every line the
+  // operator set is a default right now — including `permissionMode`, which is
+  // the Matrix approval relay. Said here because `/prinny status` is where
+  // somebody looks when the channel is not behaving as configured.
+  const settingsLayer = readSettingsLayer();
+  if (settingsLayer.status === 'malformed') {
+    lines.push(
+      `  settings:     UNREADABLE (${settingsLayer.error}) — running on DEFAULTS, ` +
+        `permissionMode ${DEFAULT_SETTINGS.permissionMode}. Fix ${SETTINGS_FILE}; the next ` +
+        '/prinny set keeps it as <name>.corrupt-<time> and starts fresh.'
+    );
+  }
+  // AN2: three states, because `built` was the honest-looking answer for a
+  // runtime compiled from sources this checkout no longer has — which is what
+  // it said here while the staged tree was missing `connect.ts` entirely.
+  const runtime = runtimeState();
+  lines.push(
+    `  runtime:      ${
+      runtime === 'current'
+        ? 'built, current'
+        : runtime === 'stale'
+          ? 'STALE — built from different sources; run /prinny prepare'
+          : 'NOT BUILT — run /prinny prepare'
+    }`
+  );
   lines.push(`  state dir:    ${STATE_DIR}`);
   lines.push(`  log:          ${LOG_FILE}`);
   lines.push('');
@@ -1865,7 +2046,15 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext): Promis
       const needsRestart = (
         ['requestTimeoutSeconds', 'connectTimeoutSeconds'] as string[]
       ).includes(parsed.key);
-      return `${parsed.key} = ${JSON.stringify(parsed.value)}.${
+      // AO2: say how the list is matched. pi's built-in tools are lower case
+      // (`bash`, `edit`, `write`) and this repo's own are not (`Agent`,
+      // `StopAgent`), so an operator who cannot see the matching rule has no way
+      // to tell a name that gates from a name that is merely stored.
+      const note =
+        parsed.key === 'permissionTools'
+          ? ' Matched ignoring case, so `Bash` and `bash` are the same tool.'
+          : '';
+      return `${parsed.key} = ${JSON.stringify(parsed.value)}.${note}${
         needsRestart ? ' Applies to the next channel start — /prinny restart.' : ''
       }`;
     }
@@ -1887,13 +2076,15 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext): Promis
       if (rest[0] === 'token') {
         const token = rest[1];
         if (!token) return 'usage: /prinny configure token <access-token>';
-        updateEnv({ PRINNY_ACCESS_TOKEN: token });
+        // AN3: and clear the device id with it. See `credentialUpdatesForToken`.
+        updateEnv(credentialUpdatesForToken(token));
         // AK1: the tool and its two promptGuidelines exist from here on, not
         // from the next session. See ensureToolsRegistered.
         ensureToolsRegistered(api);
         return (
-          'token saved. The channel resolves the matching device ID from /account/whoami on ' +
-          'its next start.\n\n' +
+          'token saved, and the stored device ID cleared with it — a token belongs to a device, ' +
+          'and the next start resolves the matching one from /account/whoami (which is also where ' +
+          'a token belonging to another account is caught).\n\n' +
           'Note: without a password at least once, the bot cannot cross-sign itself, and ' +
           'modern clients then exclude it from end-to-end key sharing — it will appear to ' +
           'ignore people in encrypted rooms.\n\n' +
@@ -1962,8 +2153,11 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext): Promis
       // [matrix] marker is untrusted input rides on this tool's registration.
       const toolArrived = ensureToolsRegistered(api);
 
-      const prepared = existsSync(RUNTIME_ENTRY);
-      const prepareNote = prepared ? '' : `\n\n${await runPrepare(ctx)}`;
+      // AN2: `current`, not merely present. This is the one command that runs a
+      // prepare on the operator's behalf, at the one moment waiting is expected —
+      // and it skipped it for a runtime that was going to have to rebuild anyway,
+      // during the start two lines down.
+      const prepareNote = runtimeState() === 'current' ? '' : `\n\n${await runPrepare(ctx)}`;
       await stopChannel();
       await startChannel();
 

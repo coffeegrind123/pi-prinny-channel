@@ -9,15 +9,24 @@
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-/** Must match `server/src/state.ts`. */
+import { stateDir as sharedStateDir } from '../server/bin/agent-dir.mjs';
+import { quarantine, readJsonObject, writeJsonAtomic, type LayerStatus } from './json-store.ts';
+
+/**
+ * Must match `server/src/state.ts`.
+ *
+ * AO7: through `server/bin/agent-dir.mjs`, which expands a leading `~` the way
+ * pi's own `getAgentDir()` does. This used to be
+ * `env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')` — the same
+ * expression as the other three readers, and the same one variable short of
+ * pi's answer. `server/src/state.ts` cannot import this file (it is compiled
+ * into a runtime outside the repo, `rootDir: src`), so it carries the rule again
+ * and `tests/config.test.ts` asserts the two agree.
+ */
 export function stateDir(env: NodeJS.ProcessEnv = process.env): string {
-  return (
-    env.PRINNY_STATE_DIR ??
-    join(env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'), 'channels', 'prinny')
-  );
+  return sharedStateDir(env);
 }
 
 export const STATE_DIR = stateDir();
@@ -148,13 +157,33 @@ const PERMISSION_MODES: PermissionMode[] = ['off', 'dangerous', 'all'];
  * permission mode.
  */
 export function readSettings(file = SETTINGS_FILE): PiSettings {
-  let raw: Record<string, unknown> = {};
-  try {
-    const parsed = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
-    if (parsed && typeof parsed === 'object') raw = parsed;
-  } catch {
-    // Absent or unreadable: defaults, which are the documented starting state.
-  }
+  return readSettingsLayer(file).settings;
+}
+
+/**
+ * The same read, saying WHICH kind of nothing it found.
+ *
+ * AN1: the paragraph above is true of a bad VALUE and false of a bad FILE. A
+ * missing comma throws out of `JSON.parse`, every key falls to its default, and
+ * `permissionMode` goes from `all` to `off` — the Matrix approval relay
+ * switched off by a typo, silently. Worse, the next `/prinny set` writes those
+ * defaults over the file, so the settings are not merely unread, they are gone.
+ *
+ * `settingsStatus` is what `/prinny status` prints and what `writeSettings`
+ * consults before it replaces anything. See `json-store.ts`.
+ */
+export function readSettingsLayer(file = SETTINGS_FILE): {
+  settings: PiSettings;
+  status: LayerStatus;
+  error?: string;
+} {
+  const read = readJsonObject(file);
+  const raw: Record<string, unknown> = read.status === 'loaded' ? read.value! : {};
+  return { settings: coerceSettings(raw), status: read.status, error: read.error };
+}
+
+/** Per-key coercion: a bad value falls back alone, which is the promise above. */
+function coerceSettings(raw: Record<string, unknown>): PiSettings {
 
   const asEnum = <T extends string>(value: unknown, allowed: T[], fallback: T): T =>
     typeof value === 'string' && (allowed as string[]).includes(value) ? (value as T) : fallback;
@@ -225,10 +254,18 @@ export function parseSetting(
         ? { ok: true, key, value: value as PermissionMode }
         : bad(PERMISSION_MODES.join(' | '));
     case 'permissionTools': {
-      const tools = value
-        .split(',')
-        .map((name) => name.trim())
-        .filter(Boolean);
+      // AO2: de-duplicated by the same question the GATE now asks — see
+      // `namesTool` in permission-gate.ts. `bash, Bash` is one instruction, and
+      // storing it twice would show the operator a list whose length is a claim
+      // about how many tools are gated.
+      const seen = new Set<string>();
+      const tools: string[] = [];
+      for (const name of value.split(',').map((n) => n.trim()).filter(Boolean)) {
+        const folded = name.toLowerCase();
+        if (seen.has(folded)) continue;
+        seen.add(folded);
+        tools.push(name);
+      }
       return { ok: true, key, value: tools };
     }
     case 'permissionTimeoutSeconds':
@@ -255,9 +292,62 @@ export function parseSetting(
  */
 export function writeSettings(settings: PiSettings, file = SETTINGS_FILE): void {
   ensureStateDir(dirname(file));
-  const tmp = `${file}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, file);
+  // AN1: bytes nobody could read are moved aside before they are replaced.
+  // Checked here rather than remembered from the last read, because
+  // `readSettings` is called on demand all over this extension and the file may
+  // have been hand-edited since — one `statSync`-shaped read is the price.
+  const before = readJsonObject(file);
+  if (before.status === 'malformed') {
+    const moved = quarantine(file);
+    process.stderr.write(
+      moved
+        ? `prinny: ${file} could not be parsed; kept it as ${moved} and started fresh.\n`
+        : `prinny: ${file} could not be parsed and could not be moved aside; overwriting it.\n`
+    );
+  }
+  const written = writeJsonAtomic(file, settings);
+  if (!written.ok) process.stderr.write(`prinny: could not save ${file}: ${written.error}\n`);
+}
+
+/**
+ * The env keys `/prinny configure token <t>` has to write — AN3.
+ *
+ * A Matrix access token belongs to a DEVICE. `PRINNY_DEVICE_ID` is written by
+ * whoever minted the last one: a password login through `onCredentials`, or
+ * `resolveDeviceId`'s `/account/whoami` lookup. Setting a new token by hand and
+ * leaving that key behind hands the next start a device id that belongs to a
+ * different token.
+ *
+ * `resolveDeviceId` reads the stored one FIRST:
+ *
+ * ```js
+ *   async function resolveDeviceId() {
+ *     if (creds.deviceId) return creds.deviceId;      // ← never asks
+ *     if (!creds.accessToken) return undefined;
+ *     …/_matrix/client/v3/account/whoami…
+ * ```
+ *
+ * so the command's own reply — *"The channel resolves the matching device ID
+ * from /account/whoami on its next start"* — is false in exactly the case that
+ * is normal: a channel that has run before. The bot then builds a Rust-crypto
+ * client claiming to be the OLD device while the homeserver considers the token
+ * to be a new one, which is the shape of the failure `state.ts` warns about in
+ * its own words — a bot that "will appear to ignore people in encrypted rooms",
+ * with nothing in the log.
+ *
+ * And the whoami call is not only a lookup: it is where the token's OWNER is
+ * checked (`the access token belongs to X, not PRINNY_USER_ID`). Short-circuited,
+ * a token pasted from another account is not caught either.
+ *
+ * The three-argument `configure` already clears both keys when the user id
+ * changes, under the comment *"Replacing the account: the stored token and
+ * device belong to the old one"*. This is the same sentence for the token-only
+ * arm, which had it too and did not say it.
+ *
+ * `null` is `updateEnv`'s delete.
+ */
+export function credentialUpdatesForToken(token: string): Record<string, string | null> {
+  return { PRINNY_ACCESS_TOKEN: token, PRINNY_DEVICE_ID: null };
 }
 
 /** Whether the channel has credentials at all. Cheap enough to call on demand. */

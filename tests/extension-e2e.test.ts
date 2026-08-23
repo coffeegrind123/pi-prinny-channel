@@ -26,6 +26,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { after, before, describe, expect, it } from './harness.ts';
+
+import { sourceFingerprint } from '../server/bin/runtime-stamp.mjs';
 // @ts-expect-error — plain .mjs fixture, no types, deliberately dependency-free
 import { startStubModel } from './fixtures/stub-model.mjs';
 
@@ -99,6 +101,15 @@ before(async () => {
   );
   mkdirSync(join(stateDir, 'runtime', 'dist'), { recursive: true });
   writeFileSync(join(stateDir, 'runtime', 'dist', 'server.js'), '');
+  // AN2: a compiled entry is no longer enough — `startupBlocker()` asks whether
+  // it was built from THESE sources, because a runtime built from older ones
+  // re-stages inside the connect budget. The fake stamps itself with the real
+  // fingerprint, which is what a real `--prepare` writes: the check is part of
+  // what is under test, so it is satisfied rather than bypassed.
+  writeFileSync(
+    join(stateDir, 'runtime', '.source-stamp'),
+    sourceFingerprint(fileURLToPath(new URL('../server', import.meta.url)))
+  );
 
   // Its own agent directory, so the run does not inherit the developer's
   // providers, packages or settings — any of which change what pi does here.

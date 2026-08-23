@@ -11,6 +11,35 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 /**
+ * `~` and `~/…` expanded the way pi's `expandTildePath` does — AO7.
+ *
+ * Written out here rather than imported: this file is compiled with
+ * `rootDir: src` into a runtime directory outside the repo, so it cannot reach
+ * `../bin/agent-dir.mjs`, which is where the other three readers get it.
+ * `tests/config.test.ts` asserts the two copies agree, the way the compaction
+ * lock's four copies are handled.
+ */
+function expandTilde(path: string): string {
+  if (path === '~') return homedir();
+  const separated = path.startsWith('~/') || (process.platform === 'win32' && path.startsWith('~\\'));
+  return separated ? join(homedir(), path.slice(2)) : path;
+}
+
+/**
+ * `~/.pi/agent`, or pi's own override for it.
+ *
+ * Must match `server/bin/agent-dir.mjs`, which is pi's `getAgentDir()`:
+ * `if (envDir) return expandTildePath(envDir)`. The expansion is the part that
+ * was missing — `PI_CODING_AGENT_DIR=~/pi-work` read out of an `.env` is not
+ * expanded by any shell, and without this the channel's crypto store lands in a
+ * directory named `~`, relative to whatever the cwd happened to be.
+ */
+function agentDir(): string {
+  const override = process.env.PI_CODING_AGENT_DIR;
+  return override ? expandTilde(override) : join(homedir(), '.pi', 'agent');
+}
+
+/**
  * `~/.pi/agent/channels/prinny` by default.
  *
  * `PI_CODING_AGENT_DIR` is pi's own override for `~/.pi/agent`, so a pi
@@ -18,12 +47,7 @@ import { join } from 'node:path';
  * rather than leaving it behind in a directory nothing else uses.
  */
 export const STATE_DIR =
-  process.env.PRINNY_STATE_DIR ??
-  join(
-    process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'),
-    'channels',
-    'prinny'
-  );
+  process.env.PRINNY_STATE_DIR ?? join(agentDir(), 'channels', 'prinny');
 
 export const ACCESS_FILE = join(STATE_DIR, 'access.json');
 export const APPROVED_DIR = join(STATE_DIR, 'approved');

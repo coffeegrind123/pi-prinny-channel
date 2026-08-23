@@ -97,6 +97,46 @@ export function writeAccess(access: Access, file = ACCESS_FILE): void {
   renameSync(tmp, file);
 }
 
+/**
+ * Is `key` actually IN this record? — AO6, twenty-fourth pass.
+ *
+ * `access.pending`, `access.rooms` and every other `Record<string, …>` here
+ * comes out of `JSON.parse`, so it carries `Object.prototype`, and a plain
+ * `obj[key]` answers for eight keys nobody ever stored:
+ *
+ * ```
+ *   constructor  toString  valueOf  hasOwnProperty
+ *   __proto__    isPrototypeOf  propertyIsEnumerable  toLocaleString
+ * ```
+ *
+ * Every one of them is truthy. `pair('constructor')` therefore found an
+ * "entry", read `undefined` off it for `senderId` and `roomId`, compared
+ * `undefined < now` (false, so not expired), pushed `undefined` onto the
+ * allowlist — where it is serialised as `null` — deleted nothing, and reported
+ * `paired undefined. They can now reach this session.` `deny('toString')` and
+ * `removeRoom('valueOf')` each reported having removed something that was never
+ * there.
+ *
+ * This package already writes the correct form nine files over, in
+ * `command-routing.ts`, and for exactly this reason:
+ *
+ * ```js
+ *   if (Object.prototype.hasOwnProperty.call(MATRIX_LOCAL, name)) …
+ *   if (!Object.prototype.hasOwnProperty.call(MATRIX_ALLOWED, name)) …
+ * ```
+ *
+ * — over two tables this file's authors wrote, against a `name` that comes from
+ * a Matrix message. The tables here are read against a code the operator types
+ * and a room id the MODEL supplies, and they had the other form.
+ *
+ * `Object.hasOwn` is the modern spelling and is available on the Node this runs
+ * on; the `.call` form is kept so both halves of the package say it the same
+ * way and a grep finds all of them.
+ */
+export function hasEntry(record: object | undefined, key: string): boolean {
+  return record !== undefined && record !== null && Object.prototype.hasOwnProperty.call(record, key);
+}
+
 /** Read, mutate, write. The only supported way to change the file. */
 export function updateAccess<T>(mutate: (access: Access) => T, file = ACCESS_FILE): T {
   const access = readAccess(file);
@@ -138,7 +178,9 @@ export type PairOutcome =
  */
 export function pair(code: string, now = Date.now(), file = ACCESS_FILE): PairOutcome {
   return updateAccess((access) => {
-    const entry = access.pending[code];
+    // AO6: `hasEntry`, not truthiness — `access.pending` came from JSON.parse
+    // and answers for `constructor`, `toString` and six more.
+    const entry = hasEntry(access.pending, code) ? access.pending[code] : undefined;
     if (!entry) {
       const codes = Object.keys(access.pending);
       return {
@@ -160,7 +202,8 @@ export function pair(code: string, now = Date.now(), file = ACCESS_FILE): PairOu
 
 export function deny(code: string, file = ACCESS_FILE): boolean {
   return updateAccess((access) => {
-    if (!access.pending[code]) return false;
+    // AO6. `deny('toString')` used to answer "discarded pairing toString".
+    if (!hasEntry(access.pending, code)) return false;
     delete access.pending[code];
     return true;
   }, file);
@@ -213,7 +256,9 @@ export function addRoom(
 
 export function removeRoom(roomId: string, file = ACCESS_FILE): boolean {
   return updateAccess((access) => {
-    if (!access.rooms[roomId]) return false;
+    // AO6, and here the key can also be a room policy that is legitimately
+    // falsy-shaped; `hasEntry` asks about presence rather than about value.
+    if (!hasEntry(access.rooms, roomId)) return false;
     delete access.rooms[roomId];
     return true;
   }, file);

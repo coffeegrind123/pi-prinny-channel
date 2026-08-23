@@ -45,11 +45,69 @@ describe('enqueue', () => {
     expect(q.readQueue()).toHaveLength(1);
   });
 
-  it('refuses anything already delivered, which is what stops a re-answer', async () => {
+  /**
+   * AO4. This test used to be
+   *
+   * ```js
+   *   q.writeWatermark(at(-3000));
+   *   expect(q.enqueue(message('$old', at(-4000)))).toBe(false);
+   * ```
+   *
+   * — and it passed for the reason the code was wrong: it asserted that a
+   * message NOBODY HAD EVER DELIVERED is refused, because it carries an earlier
+   * timestamp than one that was. `$old` is a distinct event id; the only thing
+   * that made it "already delivered" was the clock.
+   */
+  it('refuses a message that was actually delivered, by its id', async () => {
     const q = await loadModule(stateDir);
-    q.writeWatermark(at(-3000));
-    expect(q.enqueue(message('$old', at(-4000)))).toBe(false);
+    q.writeWatermark(at(-3000), '$delivered');
+    expect(q.enqueue(message('$delivered', at(-3000)))).toBe(false);
     expect(q.enqueue(message('$new', at(-1000)))).toBe(true);
+  });
+
+  it('accepts a message stamped BEFORE the mark that was never delivered', async () => {
+    // Two homeservers are two clocks, and federation delivers out of order.
+    const q = await loadModule(stateDir);
+    q.writeWatermark(at(-3000), '$delivered');
+    expect(q.enqueue(message('$skewed', at(-4000)))).toBe(true);
+    expect(q.readQueue().map((m) => m.id)).toEqual(['$skewed']);
+  });
+
+  it('accepts a message stamped in the same millisecond as a delivered one', async () => {
+    const q = await loadModule(stateDir);
+    q.writeWatermark(at(-3000), '$delivered');
+    expect(q.enqueue(message('$twin', at(-3000)))).toBe(true);
+  });
+
+  it('still refuses history from before the clock-skew horizon', async () => {
+    const q = await loadModule(stateDir);
+    q.writeWatermark(at(-3000), '$delivered');
+    expect(q.enqueue(message('$ancient', at(-3000) - q.CLOCK_SKEW_MS - 1))).toBe(false);
+  });
+
+  it('alreadyDelivered is the rule, and it is identity above the horizon', async () => {
+    const q = await loadModule(stateDir);
+    const mark = { ts: at(0), ids: ['$seen'] };
+    expect(q.alreadyDelivered({ id: '$seen', ts: at(-1) }, mark)).toBe(true);
+    expect(q.alreadyDelivered({ id: '$fresh', ts: at(-1) }, mark)).toBe(false);
+    expect(q.alreadyDelivered({ id: '$fresh', ts: at(-q.CLOCK_SKEW_MS - 1) }, mark)).toBe(true);
+    expect(q.alreadyDelivered({ id: '$seen', ts: at(-q.CLOCK_SKEW_MS - 1) }, mark)).toBe(true);
+  });
+
+  it('the remembered ids are bounded', async () => {
+    const q = await loadModule(stateDir);
+    for (let i = 0; i < q.MAX_REMEMBERED_IDS + 25; i++) q.writeWatermark(at(-1000), `$e${i}`);
+    expect(q.readWatermark().ids).toHaveLength(q.MAX_REMEMBERED_IDS);
+    // The newest survive: those are the ones a catch-up can still re-offer.
+    expect(q.readWatermark().ids.at(-1)).toBe(`$e${q.MAX_REMEMBERED_IDS + 24}`);
+  });
+
+  it('a watermark file written before this pass reads as a mark with no ids', async () => {
+    writeFileSync(join(stateDir, 'watermark.json'), JSON.stringify({ ts: at(-3000) }));
+    const q = await loadModule(stateDir);
+    expect(q.readWatermark()).toEqual({ ts: at(-3000), ids: [] });
+    // Below the horizon it behaves exactly as it did.
+    expect(q.enqueue(message('$ancient', at(-3000) - q.CLOCK_SKEW_MS - 1))).toBe(false);
   });
 
   it('keeps the queue in timestamp order however it arrives', async () => {
@@ -98,7 +156,8 @@ describe('flush', () => {
     const q = await loadModule(stateDir);
     q.enqueue(message('$a', at(-3000)));
     await q.flush(async () => undefined);
-    expect(q.readWatermark()).toBe(at(-3000));
+    expect(q.readWatermark().ts).toBe(at(-3000));
+    expect(q.readWatermark().ids).toEqual(['$a']);
     expect(q.enqueue(message('$a', at(-3000)))).toBe(false);
   });
 
@@ -119,7 +178,7 @@ describe('flush', () => {
     // $b must survive: it was attempted, not delivered. Dropping it here is
     // exactly the data loss the queue exists to prevent.
     expect(q.readQueue().map((m) => m.id)).toEqual(['$b', '$c']);
-    expect(q.readWatermark()).toBe(at(-3000));
+    expect(q.readWatermark().ts).toBe(at(-3000));
   });
 
   it('passes position, so a backlog item can be labelled as one', async () => {
@@ -160,7 +219,7 @@ describe('durability', () => {
     // Simulates a crash between queueing and delivering: no flush happens.
     const second = await loadModule(stateDir);
     expect(second.readQueue()).toHaveLength(1);
-    expect(second.readWatermark()).toBe(0);
+    expect(second.readWatermark()).toEqual({ ts: 0, ids: [] });
   });
 
   it('starts fresh from a corrupt queue file rather than refusing to run', async () => {
@@ -180,8 +239,11 @@ describe('durability', () => {
 
   it('never moves the watermark backwards', async () => {
     const q = await loadModule(stateDir);
-    q.writeWatermark(at(-1000));
-    q.writeWatermark(at(-9000));
-    expect(q.readWatermark()).toBe(at(-1000));
+    q.writeWatermark(at(-1000), '$new');
+    q.writeWatermark(at(-9000), '$late');
+    expect(q.readWatermark().ts).toBe(at(-1000));
+    // …but a late message IS remembered, which is the point of AO4: it did not
+    // advance the mark and it must still never be delivered twice.
+    expect(q.readWatermark().ids).toEqual(['$new', '$late']);
   });
 });

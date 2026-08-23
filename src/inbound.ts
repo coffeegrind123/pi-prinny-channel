@@ -161,7 +161,20 @@ export function renderChannelBlock(message: ChannelMessage): string {
  * room_id, message_id, ts, is_direct, user_id, attachment_name/mime/size,
  * queued_for, backlog_position, and the `chat_id` alias.
  */
-export function renderInboundMessage(message: ChannelMessage): string {
+/**
+ * What to add when this rendering has to be told apart from another — AO3.
+ *
+ * `nameSender` includes `from=` where it would normally be dropped (a DM);
+ * `tag` adds an opaque `#n`, for the case where naming the sender is not enough
+ * because two senders share a display name. Both are off in the ordinary case
+ * and cost nothing there. See {@link uniqueInjection}.
+ */
+export interface RenderOptions {
+  nameSender?: boolean;
+  tag?: number;
+}
+
+export function renderInboundMessage(message: ChannelMessage, options: RenderOptions = {}): string {
   const meta = message.meta ?? {};
   const notes: string[] = [];
 
@@ -172,9 +185,11 @@ export function renderInboundMessage(message: ChannelMessage): string {
     notes.push(`attachment=${meta.attachment_kind}`);
   }
 
-  // Only in a room. `is_direct` is the sidecar's own flag, so a sender cannot
-  // suppress their own name by choosing a display name that looks like one.
-  if (meta.is_direct !== 'true') {
+  // Only in a room — or when this rendering has to be distinguishable from
+  // another one outstanding at the same moment (AO3). `is_direct` is the
+  // sidecar's own flag, so a sender cannot suppress their own name by choosing
+  // a display name that looks like one.
+  if (meta.is_direct !== 'true' || options.nameSender) {
     const who = typeof meta.user === 'string' && meta.user ? meta.user : meta.user_id;
     if (typeof who === 'string' && who) notes.push(`from=${safeAnnotation(who)}`);
   }
@@ -184,9 +199,91 @@ export function renderInboundMessage(message: ChannelMessage): string {
     notes.push(`delayed=${age}`);
   }
 
+  if (typeof options.tag === 'number' && Number.isFinite(options.tag)) {
+    notes.push(`#${Math.trunc(options.tag)}`);
+  }
+
   const head = notes.length > 0 ? `[${MARKER} ${notes.join(' ')}]` : `[${MARKER}]`;
   const body = neutralizeMarker(message.content ?? '').trim();
   return `${head} ${body}`;
+}
+
+/**
+ * How many widenings `uniqueInjection` will try before it gives up and returns
+ * the widest it reached. Two rooms is the case; a hundred outstanding rooms all
+ * saying the same word is not a thing this has to be fast about.
+ */
+const MAX_DISTINGUISHING_TAGS = 64;
+
+/**
+ * A rendering of this message that no other OUTSTANDING message could have
+ * produced — AO3, twenty-fourth pass.
+ *
+ * ## What the room's liveness is decided by
+ *
+ * A room becomes eligible for an answer when pi echoes its message back as a
+ * `user` message: `markLive` in the extension walks `awaitingReply` and marks
+ * the first entry `blockMatches` accepts, and `blockMatches` is
+ *
+ * ```js
+ *   if (entry.injected) return userMessageText.trim() === entry.injected.trim();
+ * ```
+ *
+ * — the whole rendered string. `markLive`'s own docstring still says *"Matching
+ * is on the Matrix event ID, which is unique and appears in the block as an
+ * attribute"*, and that stopped being true when the `<channel …>` block was
+ * replaced by the `[matrix]` marker: `renderInboundMessage` drops `room_id`,
+ * `message_id`, `user_id` and, in a DM, the sender's name as well. The
+ * identifier the match was designed around is gone, and what replaced it is not
+ * unique.
+ *
+ * ```
+ *   two DMs, two senders, one word         both render as   "[matrix] hi"
+ * ```
+ *
+ * ## Why that is a leak and not a nuisance
+ *
+ * `liveRooms()` is what `forwardToMatrix` and `resolveActionRoom` both read, and
+ * `forwardToMatrix` sends the turn's answer when exactly ONE room is live. If
+ * two rooms are outstanding with the same rendering and only one of the two was
+ * actually taken by pi — a delivery that threw because a compaction was in
+ * flight is the ordinary way that happens, and `delivery.ts` exists because it
+ * cannot be observed — the single echo marks whichever entry the Map yields
+ * first. That may be the room whose message pi never saw. The answer to the
+ * other person's question is then forwarded to it, and the person who actually
+ * asked is told a minute later that their message could not be handed over.
+ *
+ * `markLive` is the function whose own docstring says what is at stake: *"the
+ * current turn's answer, about the operator's private local work, would be
+ * forwarded to whoever just messaged. Nobody would see that happen from this
+ * side."*
+ *
+ * ## The widening, and its cost
+ *
+ * Nothing is added in the ordinary case — one outstanding room, or two whose
+ * words differ, renders exactly as before. When a collision would occur the
+ * sender is named, which is information the model can use rather than a
+ * disambiguating token it cannot; and only if that still collides does an
+ * opaque `#n` go on. So the token cost is zero except in the case that was
+ * previously a mis-delivery.
+ *
+ * `outstanding` is every OTHER pending entry's `injected` text. The caller
+ * passes what it holds; this function does not know about rooms.
+ */
+export function uniqueInjection(message: ChannelMessage, outstanding: Iterable<string>): string {
+  const taken = new Set(outstanding);
+  const plain = renderInboundMessage(message);
+  if (!taken.has(plain)) return plain;
+
+  const named = renderInboundMessage(message, { nameSender: true });
+  if (!taken.has(named)) return named;
+
+  let widest = named;
+  for (let tag = 2; tag <= MAX_DISTINGUISHING_TAGS; tag++) {
+    widest = renderInboundMessage(message, { nameSender: true, tag });
+    if (!taken.has(widest)) return widest;
+  }
+  return widest;
 }
 
 /** The room a block came from, for the auto-reply fallback. */

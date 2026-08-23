@@ -21,6 +21,55 @@ import type { PermissionMode, PiSettings } from './config.ts';
 const MUTATING_TOOLS = new Set(['bash', 'edit', 'write']);
 
 /**
+ * Is this the tool the operator named? — AO2, twenty-fourth pass.
+ *
+ * `permissionTools` is the always-ask list, and `needsApproval`'s first branch
+ * says what it is for: *"An explicitly listed tool is gated whatever the mode
+ * says — including when the mode is `off`, because naming a tool is a more
+ * specific instruction than choosing a mode."* It is therefore the one entry in
+ * this file that can be the ONLY gate in force.
+ *
+ * It was matched with `settings.permissionTools.includes(toolName)`, an exact
+ * string compare, against a list this package accepts unvalidated:
+ * `parseSetting` splits on commas, trims, and stores whatever is left. Every
+ * other setting in that switch is checked against its enum, and every other
+ * allowlist in this package validates its entries and says why —
+ * `MXID_RE` (*"A bare localpart in the allowlist silently matches nobody"*) and
+ * `ROOM_ID_RE` (*"an alias moves between rooms, an ID does not"*). The list of
+ * TOOL names had neither.
+ *
+ * Tool names in this stack are not one case. pi's built-ins are lower —
+ * `bash`, `edit`, `write`, `read`, `grep`, `find`, `ls` — and this repo's own
+ * are not: `Agent`, `AgentStatus`, `StopAgent`. So
+ *
+ * ```
+ *   /prinny set permissionTools Bash        stored, echoed back, gates NOTHING
+ *   /prinny set permissionTools agent       stored, echoed back, gates NOTHING
+ * ```
+ *
+ * and the failure is silent in both directions: nothing refuses the name, and a
+ * gate that never fires looks exactly like a gate the operator configured
+ * correctly and a model that never did anything risky.
+ *
+ * There is no tool registry on `ExtensionContext` to check a name against — pi
+ * exposes `ui`, `mode`, `cwd`, `sessionManager`, `modelRegistry`, `model`,
+ * `scopedModels`, `thinkingLevel` and the lifecycle calls, and nothing that
+ * lists tools — so the repair is at the comparison rather than at the write.
+ * Case-folded, which is the `ask` direction: the only way folding changes an
+ * outcome is by gating a call the operator had already named, and this module's
+ * own rule is *"The direction of every judgement call below is ask, never
+ * skip"*. Two tools differing only by case would both gate, which is the same
+ * direction again.
+ *
+ * Surrounding whitespace is folded away for the same reason `parseSetting`
+ * trims: `bash , write` is one operator writing two names, not three.
+ */
+export function namesTool(toolName: string, list: readonly string[]): boolean {
+  const wanted = toolName.trim().toLowerCase();
+  return list.some((name) => name.trim().toLowerCase() === wanted);
+}
+
+/**
  * Commands worth a second opinion, under `dangerous`.
  *
  * Each entry names what it is guarding, because a bare regex list rots into
@@ -278,7 +327,9 @@ export function needsApproval(
   // An explicitly listed tool is gated whatever the mode says — including when
   // the mode is `off`, because naming a tool is a more specific instruction
   // than choosing a mode.
-  if (settings.permissionTools.includes(toolName)) {
+  // AO2: `namesTool`, not `.includes` — see above. The stored list is whatever
+  // the operator typed, and pi's tool names are not one case.
+  if (namesTool(toolName, settings.permissionTools)) {
     return { gate: true, reason: `${toolName} is on the always-ask list` };
   }
 

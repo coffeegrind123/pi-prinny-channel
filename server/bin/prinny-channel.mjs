@@ -26,14 +26,12 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import {
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -42,15 +40,21 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+// AN2: the fingerprint lives in a module with no side effects, so the extension
+// and the launch script can ask the same question this file asks. This file
+// bootstraps at import — it stages, compiles and then imports the server — so
+// nothing could ever ask IT, which is why three other readers each invented a
+// weaker test. See `runtime-stamp.mjs`.
+import { stateDir } from './agent-dir.mjs'
+import { STAGED_FILES, sourceFingerprint, stagedState, stampPath } from './runtime-stamp.mjs'
+
 const PAYLOAD_ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 
-const STATE_DIR =
-  process.env.PRINNY_STATE_DIR ??
-  join(
-    process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'),
-    'channels',
-    'prinny',
-  )
+// AO7: through `agent-dir.mjs`, which expands a leading `~` the way pi's own
+// `getAgentDir()` does. This is the file that reads the channel's `.env`, so it
+// is also the one that would look for `PI_CODING_AGENT_DIR` in the wrong place
+// and then never find `PRINNY_BOT_PATH` or `PRINNY_RUNTIME_DIR` either.
+const STATE_DIR = stateDir()
 
 /**
  * Read the channel's own .env early.
@@ -76,13 +80,10 @@ for (const line of (() => {
 
 const RUNTIME_DIR = process.env.PRINNY_RUNTIME_DIR ?? join(STATE_DIR, 'runtime')
 
-const STAMP_FILE = join(RUNTIME_DIR, '.source-stamp')
+const STAMP_FILE = stampPath(RUNTIME_DIR)
 const ENTRY = join(RUNTIME_DIR, 'dist', 'server.js')
 const LOCK_DIR = join(RUNTIME_DIR, '.bootstrap.lock')
 const LOCK_STALE_MS = 10 * 60 * 1000
-
-/** Everything the runtime needs to build. Deliberately small. */
-const STAGED_FILES = ['package.json', 'tsconfig.json', 'tsconfig.build.json']
 
 function log(msg) {
   process.stderr.write(`prinny channel: ${msg}\n`)
@@ -93,53 +94,6 @@ function mtime(path) {
     return statSync(path).mtimeMs
   } catch {
     return 0
-  }
-}
-
-/**
- * A fingerprint of the payload source: every staged file and every file under
- * src, hashed by path and **content**.
- *
- * Content rather than mtime, deliberately. A fresh clone, a branch switch and
- * a `git checkout` all rewrite mtimes, so an mtime-based stamp treats each of
- * them as a change and re-runs a minute of installing and compiling for a
- * source tree that is byte-for-byte identical. Hashing ~140KB on each start
- * costs nothing next to that.
- */
-function sourceFingerprint() {
-  const hash = createHash('sha256')
-  const addFile = (full, label) => {
-    hash.update(label)
-    hash.update('\0')
-    hash.update(readFileSync(full))
-    hash.update('\0')
-  }
-  const walk = (dir, prefix) => {
-    let entries
-    try {
-      entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      const full = join(dir, entry.name)
-      if (entry.isDirectory()) walk(full, `${prefix}${entry.name}/`)
-      else addFile(full, `${prefix}${entry.name}`)
-    }
-  }
-  for (const file of STAGED_FILES) {
-    const full = join(PAYLOAD_ROOT, file)
-    if (existsSync(full)) addFile(full, file)
-  }
-  walk(join(PAYLOAD_ROOT, 'src'), 'src/')
-  return hash.digest('hex')
-}
-
-function stampMatches(fingerprint) {
-  try {
-    return readFileSync(STAMP_FILE, 'utf8') === fingerprint
-  } catch {
-    return false
   }
 }
 
@@ -307,12 +261,12 @@ function stageRuntime(fingerprint) {
 }
 
 function isStaged() {
-  return existsSync(ENTRY) && stampMatches(sourceFingerprint())
+  return stagedState(RUNTIME_DIR, PAYLOAD_ROOT) === 'current'
 }
 
 function bootstrap() {
-  const fingerprint = sourceFingerprint()
-  if (existsSync(ENTRY) && stampMatches(fingerprint)) return
+  const fingerprint = sourceFingerprint(PAYLOAD_ROOT)
+  if (stagedState(RUNTIME_DIR, PAYLOAD_ROOT, fingerprint) === 'current') return
 
   // The lock lives inside the runtime dir, so that has to exist before anyone
   // can take it — on a first run it does not.
@@ -320,7 +274,7 @@ function bootstrap() {
 
   withLock(() => {
     // Re-check inside the lock: the session we waited on may have done it.
-    if (existsSync(ENTRY) && stampMatches(fingerprint)) return
+    if (stagedState(RUNTIME_DIR, PAYLOAD_ROOT, fingerprint) === 'current') return
     stageRuntime(fingerprint)
   })
 }
@@ -337,6 +291,26 @@ function bootstrap() {
  * Idempotent: staged and unchanged means it returns immediately.
  */
 const PREPARE_ONLY = process.argv.includes('--prepare')
+
+/**
+ * `--staged`: answer the question and exit, staging nothing.
+ *
+ * AN2. For a reader that cannot import this file — `scripts/pi-local.sh`, which
+ * printed "the prinny channel runtime is not built" from an `existsSync` on the
+ * compiled entry and therefore said nothing at all about a runtime compiled from
+ * source that has since moved. One word on stdout, and an exit code so a shell
+ * does not have to parse it:
+ *
+ *   current  0    stale  1    absent  2
+ *
+ * Cheap: a sha256 over ~140KB and two stats. It is the same work every start
+ * already does before it decides whether to install anything.
+ */
+if (process.argv.includes('--staged')) {
+  const state = stagedState(RUNTIME_DIR, PAYLOAD_ROOT)
+  process.stdout.write(`${state}\n`)
+  process.exit(state === 'current' ? 0 : state === 'stale' ? 1 : 2)
+}
 
 if (PREPARE_ONLY) {
   const alreadyStaged = isStaged()

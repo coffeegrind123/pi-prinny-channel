@@ -19,8 +19,11 @@
 import assert from 'node:assert/strict';
 import { cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { stateDir } from '../server/bin/agent-dir.mjs';
+import { sourceFingerprint, stagedState } from '../server/bin/runtime-stamp.mjs';
 
 export { after, afterEach, before, beforeEach, describe, it } from 'node:test';
 
@@ -179,29 +182,72 @@ export const vi = {
 };
 
 /**
- * Where the sidecar's compiled modules live. Must match
+ * Where the sidecar's staged runtime lives. Must match
  * `server/bin/prinny-channel.mjs`.
  */
-function runtimeDist(): string {
-  const stateDir =
-    process.env.PRINNY_STATE_DIR ??
-    join(
-      process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? '', '.pi', 'agent'),
-      'channels',
-      'prinny'
-    );
-  return join(process.env.PRINNY_RUNTIME_DIR ?? join(stateDir, 'runtime'), 'dist');
+function runtimeDir(): string {
+  // AO7: the same rule the bootstrap uses, imported rather than restated — this
+  // copy also read `process.env.HOME` where the others read `homedir()`, which
+  // is a third answer to the same question.
+  return process.env.PRINNY_RUNTIME_DIR ?? join(stateDir(), 'runtime');
 }
 
 /**
- * The runtime `dist` to test against, resolved once from the *real* state
- * directory.
+ * The runtime to test against, resolved once from the *real* state directory.
  *
  * Resolved at load, deliberately: the suites reassign `PRINNY_STATE_DIR` to a
  * temp directory for isolation, and following that would send this looking for
  * compiled output in a directory that has none.
  */
-const DIST = runtimeDist();
+const RUNTIME = runtimeDir();
+const DIST = join(RUNTIME, 'dist');
+
+/** The payload these tests are ABOUT: `vendor/prinny-channel/server`. */
+const PAYLOAD_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', 'server');
+
+/**
+ * Which program is under test — AO4's sibling, twenty-fourth pass (AO5).
+ *
+ * `loadServerModule` below imports the sidecar's COMPILED output, and its own
+ * docstring calls that a benefit: *"which has the side benefit of testing the
+ * artifact that actually ships rather than a re-compile of it."* That sentence
+ * is true exactly while the staged artifact IS this checkout's source, and
+ * nothing here ever asked whether it was.
+ *
+ * The stage is a copy of `server/src` compiled into `runtime/dist`, keyed on a
+ * content fingerprint written to `runtime/.source-stamp`. The twenty-third pass
+ * (AN2) built `stagedState()` for exactly this question — `current`, `stale` or
+ * `absent` — because four readers were each answering it with
+ * `existsSync(dist/server.js)` alone. This harness is the fifth, and it is the
+ * one whose wrong answer is silent: a `stale` runtime does not fail, it PASSES,
+ * against a build of source that no longer exists in the tree.
+ *
+ * Measured on this box while the finding was written: the stamp read
+ * `f297f2b6…`, `server/src` hashed to `94b4a2f9…`, `dist/` had no `connect.js`
+ * at all, and the suite was green — 511 tests, 116 of them against a program
+ * nobody could produce from this checkout.
+ *
+ * So the answer is asked here, once, and a stale runtime is a hard failure with
+ * the command that fixes it. Refusing is the only honest option: skipping would
+ * report a suite as passing that never ran, and compiling from here would need
+ * the staged `node_modules` and turn a test run into a build.
+ */
+export function assertRuntimeMatchesSource(runtime: string = RUNTIME, payloadRoot: string = PAYLOAD_ROOT): void {
+  if (!existsSync(join(runtime, 'dist', 'state.js'))) return; // `runtimeAvailable()` reports this one.
+  const state = stagedState(runtime, payloadRoot, sourceFingerprint(payloadRoot));
+  if (state === 'current') return;
+  const why =
+    state === 'stale'
+      ? 'it was compiled from different sources than this checkout'
+      : 'it has a dist directory but no compiled entry, so it was never finished';
+  throw new Error(
+    `the staged channel runtime at ${runtime} is ${state}: ${why}, so these tests would pass or ` +
+      'fail about a program that is not in the tree.\n' +
+      'Re-stage it with:\n' +
+      '  node vendor/prinny-channel/server/bin/prinny-channel.mjs --prepare\n' +
+      '(or `/prinny prepare` in a session). It recompiles the payload; it takes about a minute.'
+  );
+}
 
 /**
  * Import one of the sidecar's modules.
@@ -214,6 +260,9 @@ const DIST = runtimeDist();
  * artifact that actually ships rather than a re-compile of it.
  */
 export async function loadServerModule<T = Record<string, unknown>>(name: string): Promise<T> {
+  // AO5: before anything is imported, and every time, because a `--prepare` in
+  // another terminal is exactly the thing that changes the answer mid-run.
+  assertRuntimeMatchesSource();
   const file = join(DIST, `${name}.js`);
   if (!existsSync(file)) {
     throw new Error(
@@ -263,3 +312,5 @@ export function runtimeAvailable(): boolean {
 }
 
 export const RUNTIME_DIST = DIST;
+export const RUNTIME_ROOT = RUNTIME;
+export const SERVER_PAYLOAD_ROOT = PAYLOAD_ROOT;

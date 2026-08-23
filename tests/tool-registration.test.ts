@@ -77,8 +77,21 @@ describe('the prinny tool is registered the moment credentials exist (AK1)', () 
 
     // …and the full three-argument form, BEFORE the channel starts, because the
     // first inbound message can arrive as soon as it has logged in.
-    const full = bodyAfter('const toolArrived = ensureToolsRegistered(api)', 400);
-    expect(full.indexOf('ensureToolsRegistered(api)') < full.indexOf('await startChannel()')).toBe(true);
+    //
+    // Asserted as an ORDER over the whole file rather than inside a 400-char
+    // window from the first marker. The window form passed for the wrong reason
+    // and failed for one too: AN2 added five lines of comment between the two
+    // statements and `await startChannel()` fell off the end, so a test of an
+    // invariant that still held reported it broken. That is §11.7 of the
+    // twenty-second pass — *a test that pinned the wrong thing* — one file over:
+    // the invariant is "in this order", and a byte distance is not that.
+    const registered = SOURCE.indexOf('const toolArrived = ensureToolsRegistered(api)');
+    const started = SOURCE.indexOf('await startChannel()', registered);
+    expect({ registered: registered >= 0, started: started >= 0 }).toEqual({
+      registered: true,
+      started: true,
+    });
+    expect(registered < started).toBe(true);
   });
 
   it('the guideline that makes the marker mean something rides on that tool', () => {

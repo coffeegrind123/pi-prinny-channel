@@ -288,3 +288,83 @@ describe('concurrent writers', () => {
     expect(readFileSync(file, 'utf8').endsWith('\n')).toBe(true);
   });
 });
+
+/**
+ * AO6 — a lookup that answers for a key nobody stored.
+ *
+ * `access.pending` and `access.rooms` come out of `JSON.parse`, so they carry
+ * `Object.prototype`. A plain `obj[key]` or `key in obj` is true for eight
+ * inherited names, all of them truthy, and each of the three mutations below
+ * used one of those forms.
+ */
+describe('AO6 — presence, not reachability', () => {
+  const INHERITED = [
+    'constructor',
+    'toString',
+    'valueOf',
+    'hasOwnProperty',
+    '__proto__',
+    'isPrototypeOf',
+    'propertyIsEnumerable',
+    'toLocaleString',
+  ];
+
+  it('control — every one of those really is truthy on a parsed object', () => {
+    const parsed = JSON.parse('{"real":1}') as Record<string, unknown>;
+    for (const key of INHERITED) {
+      expect(Boolean(parsed[key])).toBe(true);
+      expect(key in parsed).toBe(true);
+    }
+    // …and the correct question says no to all of them.
+    for (const key of INHERITED) expect(store.hasEntry(parsed, key)).toBe(false);
+    expect(store.hasEntry(parsed, 'real')).toBe(true);
+  });
+
+  it('pair() refuses an inherited name instead of "pairing" undefined', () => {
+    store.writeAccess({ ...store.defaultAccess(), allowFrom: ['@real:example.org'] }, file);
+    for (const key of INHERITED) {
+      const outcome = store.pair(key, Date.now(), file);
+      expect(outcome.ok).toBe(false);
+      // And the file is untouched: no `null` shoved into the allowlist.
+      expect(store.readAccess(file).allowFrom).toEqual(['@real:example.org']);
+    }
+  });
+
+  it('…while a real pending code still pairs', () => {
+    const now = Date.now();
+    store.writeAccess(
+      {
+        ...store.defaultAccess(),
+        pending: {
+          abc123: { senderId: '@sam:example.org', roomId: '!r:example.org', createdAt: now, expiresAt: now + 60_000, replies: 1 },
+        },
+      },
+      file
+    );
+    const outcome = store.pair('abc123', now, file);
+    expect(outcome.ok).toBe(true);
+    expect(store.readAccess(file).allowFrom).toEqual(['@sam:example.org']);
+    expect(Object.keys(store.readAccess(file).pending)).toEqual([]);
+  });
+
+  it('deny() reports nothing removed for an inherited name', () => {
+    store.writeAccess(store.defaultAccess(), file);
+    for (const key of INHERITED) expect(store.deny(key, file)).toBe(false);
+  });
+
+  it('removeRoom() reports nothing removed for an inherited name', () => {
+    store.writeAccess({ ...store.defaultAccess(), rooms: { '!r:example.org': { requireMention: true, allowFrom: [] } } }, file);
+    for (const key of INHERITED) expect(store.removeRoom(key, file)).toBe(false);
+    expect(store.removeRoom('!r:example.org', file)).toBe(true);
+  });
+
+  it('a room whose policy is null is still a room that exists', () => {
+    // The other half of "presence, not truthiness": a hand-edited file with a
+    // falsy value must not read as an absent key either. `undefined` cannot be
+    // used here — JSON.stringify drops the key — which is itself the reason the
+    // file format can only ever produce `null`.
+    writeFileSync(file, JSON.stringify({ ...store.defaultAccess(), rooms: { '!r:example.org': null } }));
+    expect(store.removeRoom('!r:example.org', file)).toBe(true);
+    expect(Object.keys(store.readAccess(file).rooms)).toEqual([]);
+  });
+});

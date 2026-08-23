@@ -98,7 +98,7 @@ import {
   PermissionRegistry,
   parsePermissionReply,
 } from './permissions.js';
-import { enqueue, flush, readQueue, readWatermark } from './queue.js';
+import { CLOCK_SKEW_MS, enqueue, flush, readQueue, readWatermark } from './queue.js';
 import {
   CRYPTO_SNAPSHOT_PATH,
   CRYPTO_STORE_PATH,
@@ -173,9 +173,16 @@ function requireBot(): Bot {
 
 function buildBot(deviceId: string | undefined): Bot {
   const watermark = readWatermark();
-  if (watermark === 0) {
+  if (watermark.ts === 0) {
     log('no delivery watermark yet — starting from now, not from room history');
   }
+  // AO4: the floor is the mark less the clock-skew horizon, not the mark.
+  // `origin_server_ts` comes from the SENDER's homeserver, so a message that is
+  // genuinely new can be stamped below the newest one already answered — and an
+  // event this floor excludes never reaches `enqueue`, where the id check that
+  // would have recognised it lives. Everything it lets back in is decided by
+  // event id there; see `alreadyDelivered`.
+  const catchUpFloor = watermark.ts > 0 ? Math.max(1, watermark.ts - CLOCK_SKEW_MS) : 0;
   return new (requireMatrix().Bot)({
     homeserverUrl: creds.homeserverUrl,
     userId: creds.userId,
@@ -188,7 +195,7 @@ function buildBot(deviceId: string | undefined): Bot {
     // has been delivered, a floor of 0 means everything the initial sync
     // returns counts as missed, so a fresh install would dump the last fifty
     // messages of every room into the session as backlog.
-    ...(watermark > 0 ? { catchUpFrom: watermark } : {}),
+    ...(catchUpFloor > 0 ? { catchUpFrom: catchUpFloor } : {}),
     // Bounds the catch-up: it can only see what the initial sync returns per
     // room, so a long enough outage still loses the oldest of it.
     initialSyncLimit: 50,

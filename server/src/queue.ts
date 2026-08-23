@@ -68,19 +68,101 @@ function writeQueue(queue: QueuedMessage[]): void {
 }
 
 /**
- * The timestamp of the newest message already delivered to a session.
+ * How far back a message that is genuinely NEW can be stamped — AO4.
  *
- * Everything at or below this has been seen; the catch-up on the next start
- * begins just above it.
+ * `origin_server_ts` is set by the sender's homeserver, not by ours. Two
+ * homeservers are two clocks, federation delivers out of order, and a message
+ * can therefore arrive now carrying a timestamp from before the newest one we
+ * have already answered. Five minutes is the ordinary sanity bound for that skew
+ * and is comfortably more than anything seen on one server.
+ *
+ * Below this horizon a message is old news, and the ageing rule the queue
+ * already has (`MAX_AGE_MS`) is the one that applies. Above it, the question is
+ * decided by IDENTITY rather than by time — see {@link Watermark}.
  */
-export function readWatermark(): number {
-  const value = readJson<{ ts?: number }>(WATERMARK_FILE, {});
-  return typeof value.ts === 'number' ? value.ts : 0;
+export const CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * How many delivered event IDs are remembered above the horizon. Bounded
+ * because the file is rewritten on every delivery; two hundred is far more than
+ * five minutes of one conversation and costs a few kilobytes.
+ */
+export const MAX_REMEMBERED_IDS = 200;
+
+/**
+ * What has already been handed to a session.
+ *
+ * ## The identity this used to be
+ *
+ * It was one number, and its docstring said *"Everything at or below this has
+ * been seen"*. That is a claim about IDENTITY made out of a claim about TIME,
+ * and the two come apart in three ordinary ways:
+ *
+ * ```
+ *   two events in the same millisecond      `ts <= watermark` drops the second
+ *   two rooms, two homeservers, two clocks  a live message stamped below ours
+ *   federation delivering out of order      the same, without any clock being wrong
+ * ```
+ *
+ * `enqueue` returns false in all three, and `handleInbound` reads false as
+ * *"Already delivered on an earlier run"* and returns — after the message has
+ * already been acknowledged with a reaction. From the sender's side the bot
+ * reacted and then never answered, which is the exact failure the outbox exists
+ * to prevent, reached through the outbox.
+ *
+ * ## What it is now
+ *
+ * The timestamp still bounds the catch-up — that is the job it was written for,
+ * and re-offering a week of history is not something a session should have to
+ * re-answer. But inside the last {@link CLOCK_SKEW_MS} the question is asked of
+ * the EVENT ID, which is what Matrix guarantees unique and what the queue's own
+ * de-duplication has always used one line above.
+ *
+ * A file written before this pass is `{ ts }` with no ids; it reads as a
+ * watermark with an empty id set, which is exactly the old behaviour for
+ * everything below the horizon and the new behaviour for everything above it.
+ */
+export type Watermark = {
+  /** The newest `origin_server_ts` already delivered. */
+  ts: number;
+  /** Event IDs delivered at or above `ts - CLOCK_SKEW_MS`. */
+  ids: string[];
+};
+
+export function readWatermark(): Watermark {
+  const value = readJson<{ ts?: number; ids?: unknown }>(WATERMARK_FILE, {});
+  const ts = typeof value.ts === 'number' && Number.isFinite(value.ts) ? value.ts : 0;
+  const ids = Array.isArray(value.ids) ? value.ids.filter((id): id is string => typeof id === 'string') : [];
+  return { ts, ids };
 }
 
-export function writeWatermark(ts: number): void {
-  if (ts <= readWatermark()) return;
-  writeJson(WATERMARK_FILE, { ts });
+/**
+ * Record that `id` (stamped `ts`) has been delivered.
+ *
+ * The timestamp only ever moves forward; the id set is pruned to the horizon
+ * around whichever timestamp is newer, so a late-but-fresh message is
+ * remembered even though it did not advance the mark.
+ */
+export function writeWatermark(ts: number, id?: string): void {
+  const current = readWatermark();
+  const nextTs = Math.max(current.ts, typeof ts === 'number' && Number.isFinite(ts) ? ts : 0);
+  const ids = id ? [...current.ids.filter((seen) => seen !== id), id] : [...current.ids];
+  const bounded = ids.slice(-MAX_REMEMBERED_IDS);
+  if (nextTs === current.ts && bounded.length === current.ids.length && bounded.every((v, i) => v === current.ids[i])) {
+    return;
+  }
+  writeJson(WATERMARK_FILE, { ts: nextTs, ids: bounded });
+}
+
+/**
+ * Has this message already been handed to a session?
+ *
+ * Identity above the horizon, time below it. Exported so the rule can be driven
+ * without a state directory — it is the whole of AO4.
+ */
+export function alreadyDelivered(message: Pick<QueuedMessage, 'id' | 'ts'>, watermark: Watermark): boolean {
+  if (watermark.ids.includes(message.id)) return true;
+  return message.ts < watermark.ts - CLOCK_SKEW_MS;
 }
 
 /**
@@ -93,7 +175,10 @@ export function writeWatermark(ts: number): void {
 export function enqueue(message: QueuedMessage, now = Date.now()): boolean {
   const queue = readQueue();
   if (queue.some((entry) => entry.id === message.id)) return false;
-  if (message.ts <= readWatermark()) return false;
+  // AO4: by identity above the clock-skew horizon, by time below it. This used
+  // to be `message.ts <= readWatermark()`, which reads "stamped no later than
+  // something I answered" as "the thing I answered".
+  if (alreadyDelivered(message, readWatermark())) return false;
 
   queue.push(message);
   queue.sort((a, b) => a.ts - b.ts);
@@ -111,12 +196,12 @@ export function enqueue(message: QueuedMessage, now = Date.now()): boolean {
   return bounded.some((entry) => entry.id === message.id);
 }
 
-/** Remove a delivered message and advance the watermark past it. */
+/** Remove a delivered message and record it — by id as well as by timestamp. */
 export function markDelivered(id: string): void {
   const queue = readQueue();
   const delivered = queue.find((entry) => entry.id === id);
   writeQueue(queue.filter((entry) => entry.id !== id));
-  if (delivered) writeWatermark(delivered.ts);
+  if (delivered) writeWatermark(delivered.ts, delivered.id);
 }
 
 /**

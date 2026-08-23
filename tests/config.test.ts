@@ -2,9 +2,10 @@
  * Settings, and the one rule this file duplicates from the sidecar.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, loadServerModule, vi } from './harness.ts';
 import { DEFAULT_SETTINGS, parseSetting, readSettings, stateDir, writeSettings } from '../src/config.ts';
@@ -110,6 +111,85 @@ describe('state directory', () => {
     expect(stateDir({ PI_CODING_AGENT_DIR: '/opt/pi' } as NodeJS.ProcessEnv)).toBe(
       '/opt/pi/channels/prinny'
     );
+  });
+
+  /**
+   * AO7 — the override is a path, and `~/pi-work` is a path a person writes.
+   *
+   * All four readers of `PI_CODING_AGENT_DIR` in this package used
+   * `env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')`; pi's own
+   * `getAgentDir()` runs the value through `expandTildePath` first. A value read
+   * out of the channel's `.env` is not expanded by any shell, so pi kept its
+   * files in `$HOME/pi-work` and this package kept the allowlist, the
+   * credentials and the crypto store in a directory literally named `~`,
+   * relative to whatever the cwd was.
+   */
+  it('expands a leading tilde, because pi does', () => {
+    const home = homedir();
+    expect(stateDir({ PI_CODING_AGENT_DIR: '~/pi-work' } as NodeJS.ProcessEnv)).toBe(
+      join(home, 'pi-work', 'channels', 'prinny')
+    );
+    expect(stateDir({ PI_CODING_AGENT_DIR: '~' } as NodeJS.ProcessEnv)).toBe(
+      join(home, 'channels', 'prinny')
+    );
+  });
+
+  it('does not expand a tilde that is not a home reference', () => {
+    expect(stateDir({ PI_CODING_AGENT_DIR: '/tmp/~backup' } as NodeJS.ProcessEnv)).toBe(
+      '/tmp/~backup/channels/prinny'
+    );
+  });
+
+  it('the tilde rule is pi\'s own, read out of the install rather than remembered', () => {
+    const PATHS = '/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/utils/paths.js';
+    if (!existsSync(PATHS)) return;
+    const source = readFileSync(PATHS, 'utf8');
+    expect(source).toContain('if (normalized === "~")');
+    expect(source).toContain('normalized.startsWith("~/")');
+  });
+
+  it('nobody else in this package builds the agent directory itself', () => {
+    // The scan, not the fifth fix. Two files may hold the rule: the shared
+    // helper, and `server/src/state.ts`, which cannot import it because it is
+    // compiled with `rootDir: src` into a runtime outside the repo.
+    const ALLOWED = new Set(['server/bin/agent-dir.mjs', 'server/src/state.ts']);
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        // `tests/` is skipped: a test that names the variable is asking about
+        // it, not resolving it.
+        if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'tests') continue;
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!/\.(ts|mjs)$/.test(entry.name)) continue;
+        const name = relative(root, full).replaceAll('\\', '/');
+        if (ALLOWED.has(name)) continue;
+        const code = readFileSync(full, 'utf8')
+          .replace(/\/\*[\s\S]*?\*\//g, '')
+          .replace(/^\s*\/\/.*$/gm, '');
+        if (code.includes('PI_CODING_AGENT_DIR')) offenders.push(name);
+      }
+    };
+    walk(root);
+    expect(offenders).toEqual([]);
+  });
+
+  it('the two packages answer the same question the same way', async () => {
+    // `vendor/pi-subagents-lite/src/agent-dir.ts` is the other copy of this
+    // rule. Vendor packages here do not import each other, so the copies are
+    // compared — the arrangement the compaction lock and json-store already use.
+    const { agentDir: theirs } = await import(
+      '../../pi-subagents-lite/src/agent-dir.ts'
+    );
+    const { agentDir: ours } = await import('../server/bin/agent-dir.mjs');
+    for (const value of ['~/pi-work', '~', '/opt/pi', '/tmp/~backup', '', 'relative/dir']) {
+      const env = value === '' ? {} : { PI_CODING_AGENT_DIR: value };
+      expect(ours(env)).toBe(theirs(env));
+    }
   });
 
   it('agrees with the sidecar, which computes the same path independently', async () => {

@@ -246,6 +246,60 @@ describe('assertAllowedRoom', () => {
       /not allowlisted/
     );
   });
+
+  /**
+   * AO6 — `roomId in access.rooms` walks the prototype chain, and `access.rooms`
+   * comes out of `JSON.parse`. The eight inherited names below all satisfied
+   * `in`, so this gate — whose docstring names a prompt injection as the actor
+   * it exists for — returned "allowed" for a name it had never been given.
+   *
+   * Nothing was ever posted through it: none of them is a room ID and the
+   * homeserver rejects them. It is a gate answering the wrong question, and the
+   * inbound `gate()` in the same file had the same shape one lookup over.
+   */
+  it('refuses a name it inherited rather than one it was given', async () => {
+    const { assertAllowedRoom } = await loadModule(stateDir);
+    for (const key of [
+      'constructor',
+      'toString',
+      'valueOf',
+      'hasOwnProperty',
+      '__proto__',
+      'isPrototypeOf',
+      'propertyIsEnumerable',
+      'toLocaleString',
+    ]) {
+      expect(() => assertAllowedRoom(key, new Set())).toThrow(/not allowlisted/);
+    }
+  });
+});
+
+describe('AO6 — the inbound gate asks the same question as the outbound one', () => {
+  it('drops a message whose room is only reachable through the prototype', async () => {
+    const { gate } = await loadModule(stateDir);
+    for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
+      const result = gate({ senderId: '@sam:example.org', roomId: key, isDirect: false, mentionsBot: true });
+      expect(result.action).toBe('drop');
+      expect((result as { reason: string }).reason).toBe('room not enabled');
+    }
+  });
+
+  it('control — a room that really is enabled still delivers', async () => {
+    writeAccess(stateDir, {
+      dmPolicy: 'pairing',
+      allowFrom: [],
+      rooms: { '!team:example.org': { requireMention: true, allowFrom: [] } },
+      pending: {},
+    });
+    const { gate } = await loadModule(stateDir);
+    const result = gate({
+      senderId: '@sam:example.org',
+      roomId: '!team:example.org',
+      isDirect: false,
+      mentionsBot: true,
+    });
+    expect(result.action).toBe('deliver');
+  });
 });
 
 describe('commandGate', () => {
