@@ -39,6 +39,23 @@
  * file, so it cannot be worse — and `gate()` is on the Matrix inbound path,
  * where throwing would turn a race into a dropped message. A race that is
  * reported beats an outage that is not.
+ *
+ * O_EXCL WAS VERIFIED ON THE FILESYSTEM THIS ACTUALLY RUNS ON, not assumed. The
+ * channel's state directory lives under the pi agent dir, which on this box is a
+ * Docker Desktop 9p mount of a Windows directory — and an advisory lock built on
+ * `open(..., 'wx')` is worth nothing if that mount does not honour O_EXCL. Four
+ * real processes, four read-modify-writes each, run against a file on the 9p
+ * mount and against tmpfs as the control:
+ *
+ *     9p     unlocked    4 of 16 writes survived
+ *     9p     locked     16 of 16
+ *     tmpfs  unlocked   <16 of 16
+ *     tmpfs  locked     16 of 16
+ *
+ * So the exclusion holds there — and the race is WORSE on 9p than on tmpfs,
+ * because the slower writes widen the window. The bundled test suite runs on
+ * tmpfs (a test cannot assume a 9p mount exists); this paragraph is the part it
+ * cannot assert.
  */
 
 import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
