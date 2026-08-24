@@ -129,7 +129,10 @@ export function writeJsonAtomic(
   value: unknown,
   mode = 0o600
 ): { ok: true } | { ok: false; error: string } {
-  const tmp = `${file}.tmp`;
+  // Unique per process. This helper has one writer today, but the same string
+  // in `access.json`'s two writers produced a spliced document and a reset
+  // allowlist — and the failure is invisible until a second writer appears.
+  const tmp = `${file}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode });

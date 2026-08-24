@@ -51,7 +51,9 @@ function readJson<T>(path: string, fallback: T): T {
 
 function writeJson(path: string, value: unknown): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  const tmp = `${path}.tmp`;
+  // Unique per process, for the reason `access.ts` records: a shared temp path
+  // plus O_TRUNC is a splice waiting for a second writer.
+  const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   // Atomic: a reader never sees a half-written queue, and a crash mid-write
   // leaves the previous state intact rather than a truncated file.

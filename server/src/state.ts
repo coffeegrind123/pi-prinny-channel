@@ -7,6 +7,8 @@
  */
 
 import { chmodSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+
+import { withFileLock } from './file-lock.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -96,7 +98,22 @@ export function loadEnvFile(): void {
  * Used to persist the access token minted by a password login, so the bot
  * stops re-logging-in — and stops minting a new device — on every boot.
  */
+/**
+ * Read-modify-write one or more keys of `.env`, under the file's lock.
+ *
+ * Two processes write this file: this one (saving the device id the Matrix
+ * crypto stack mints for itself) and the pi extension's `updateEnv` (saving
+ * credentials). Both rewrite the WHOLE file from a snapshot, so without the
+ * lock one of them silently reinstates the other's previous contents — and the
+ * device id is the field where that hurts: lose it and the bot comes back as a
+ * new device, which peers will not share room keys with, so it stops being able
+ * to read encrypted rooms and nothing says why.
+ */
 export function updateEnvFile(updates: Record<string, string>): void {
+  withFileLock(ENV_FILE, () => updateEnvFileLocked(updates), { onWarn: log });
+}
+
+function updateEnvFileLocked(updates: Record<string, string>): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   let lines: string[] = [];
   try {
@@ -110,7 +127,9 @@ export function updateEnvFile(updates: Record<string, string>): void {
     else lines.push(`${key}=${value}`);
   }
   const body = lines.filter((line, i) => line !== '' || i < lines.length - 1).join('\n');
-  const tmp = `${ENV_FILE}.tmp`;
+  // Unique per process: `extensions/index.ts` writes this same file from the pi
+  // side with the same helper shape, and a shared temp path splices.
+  const tmp = `${ENV_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, `${body.replace(/\n+$/, '')}\n`, { mode: 0o600 });
   renameSync(tmp, ENV_FILE);
 }

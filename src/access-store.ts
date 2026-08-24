@@ -12,12 +12,21 @@
  * read-modify-write onto whatever is currently on disk: the sidecar adds
  * `pending` entries underneath us whenever a stranger messages the bot, and a
  * blind write would clobber a pairing the user is halfway through approving.
+ *
+ * READ-MODIFY-WRITE IS NOT ENOUGH ON ITS OWN, which is what the paragraph above
+ * assumed for twenty-odd passes. Re-reading first only narrows the window; it
+ * does not close it. Sidecar reads, we read, we approve and write, sidecar
+ * writes its older snapshot back — and the approval is gone, with a revocation
+ * lost the same way if the two run in the other order. `withFileLock` closes
+ * it, and the temp path below is unique per process so that a concurrent write
+ * cannot splice one document into another either.
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { ACCESS_FILE, STATE_DIR } from './config.ts';
+import { withFileLock } from './file-lock.ts';
 
 export type PendingEntry = {
   senderId: string;
@@ -91,7 +100,13 @@ export function readAccess(file = ACCESS_FILE): Access {
 
 export function writeAccess(access: Access, file = ACCESS_FILE): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  const tmp = `${file}.tmp`;
+  // UNIQUE PER PROCESS. This was `${file}.tmp`, which the sidecar also used, and
+  // `writeFileSync` opens O_TRUNC: two processes on one path means one
+  // truncates while the other is mid-write, the second's remaining bytes land
+  // at its own now-past-the-end offset, and what gets renamed into place is one
+  // document's prefix, a hole of NULs and another's tail. The reader then
+  // quarantines it and the allowlist resets to defaults.
+  const tmp = `${file}.${process.pid}.tmp`;
   // Pretty-printed on purpose: this file is meant to survive a hand-edit.
   writeFileSync(tmp, `${JSON.stringify(access, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, file);
@@ -137,12 +152,31 @@ export function hasEntry(record: object | undefined, key: string): boolean {
   return record !== undefined && record !== null && Object.prototype.hasOwnProperty.call(record, key);
 }
 
-/** Read, mutate, write. The only supported way to change the file. */
-export function updateAccess<T>(mutate: (access: Access) => T, file = ACCESS_FILE): T {
-  const access = readAccess(file);
-  const result = mutate(access);
-  writeAccess(access, file);
-  return result;
+/**
+ * Read, mutate, write, under the file's lock. The only supported way to change
+ * the file — and now the only one that is safe against the sidecar doing the
+ * same thing at the same moment.
+ *
+ * `onWarn` is where a lock this could not take gets reported. It defaults to
+ * silence rather than to `console` because this module is imported by the
+ * extension, where stray stdout is a protocol violation; the callers that have
+ * a log pass one.
+ */
+export function updateAccess<T>(
+  mutate: (access: Access) => T,
+  file = ACCESS_FILE,
+  onWarn?: (message: string) => void
+): T {
+  return withFileLock(
+    file,
+    () => {
+      const access = readAccess(file);
+      const result = mutate(access);
+      writeAccess(access, file);
+      return result;
+    },
+    { onWarn }
+  );
 }
 
 /** MXIDs contain `:` and `/`, neither of which is a safe filename anywhere. */

@@ -71,6 +71,7 @@ import { Text } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
 import * as store from '../src/access-store.ts';
+import { withFileLock } from '../src/file-lock.ts';
 import {
   DEFAULT_SETTINGS,
   ENV_FILE,
@@ -1817,6 +1818,14 @@ Credentials
  * silently stops being able to read encrypted rooms.
  */
 function updateEnv(updates: Record<string, string | null>): void {
+  // Under the file's lock, read to write. The sidecar writes this same file
+  // from its own process (`updateEnvFile`, saving the Matrix device id) and
+  // both rewrite the whole document from a snapshot, so without the lock one
+  // silently reinstates the other's previous contents.
+  withFileLock(ENV_FILE, () => updateEnvLocked(updates), { onWarn: log });
+}
+
+function updateEnvLocked(updates: Record<string, string | null>): void {
   ensureStateDir();
   let lines: string[] = [];
   try {
@@ -1834,7 +1843,8 @@ function updateEnv(updates: Record<string, string | null>): void {
     else lines.push(`${key}=${value}`);
   }
   const body = lines.filter((line) => line.trim() !== '').join('\n');
-  const tmp = `${ENV_FILE}.tmp`;
+  // Unique per process, for the same reason the access.json temp path is.
+  const tmp = `${ENV_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, `${body}\n`, { mode: 0o600 });
   renameSync(tmp, ENV_FILE);
 }

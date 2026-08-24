@@ -21,6 +21,8 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+
+import { withFileLock } from './file-lock.js';
 import { join } from 'node:path';
 
 import { ACCESS_FILE, APPROVED_DIR, STATE_DIR, log } from './state.js';
@@ -138,7 +140,13 @@ export function loadAccess(): Access {
 export function saveAccess(access: Access): void {
   if (STATIC) return;
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  const tmp = `${ACCESS_FILE}.tmp`;
+  // UNIQUE PER PROCESS. This was `${ACCESS_FILE}.tmp`, and the extension's
+  // `writeAccess` used the same string. `writeFileSync` opens O_TRUNC, so two
+  // processes sharing one temp path splice: one truncates mid-write of the
+  // other, the other's remaining bytes land past the new end, and the atomic
+  // rename below faithfully installs the mixture. `readAccessFile` then
+  // quarantines it and every allowlist entry is gone.
+  const tmp = `${ACCESS_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(access, null, 2)}\n`, { mode: 0o600 });
   // Rename is atomic, so /prinny never reads a half-written file.
   renameSync(tmp, ACCESS_FILE);
@@ -183,6 +191,16 @@ export function gate(
   const now = options.now ?? Date.now();
   const newCode = options.newCode ?? (() => randomBytes(3).toString('hex'));
 
+  // UNDER THE FILE'S LOCK, read to write, because that is the whole span that
+  // has to be indivisible. Every `saveAccess` below writes back the snapshot
+  // `loadAccess` took at the top; without the lock the extension can read,
+  // approve a pairing and write in between, and this function's next write
+  // silently reinstates the pre-approval document. The body is a few hundred
+  // microseconds of JSON, so holding a lock across it costs nothing.
+  return withFileLock(ACCESS_FILE, () => gateLocked(inbound, now, newCode), { onWarn: log });
+}
+
+function gateLocked(inbound: Inbound, now: number, newCode: () => string): GateResult {
   const access = loadAccess();
   if (pruneExpired(access, now)) saveAccess(access);
 
@@ -254,11 +272,20 @@ export function commandGate(
   inbound: Pick<Inbound, 'senderId' | 'isDirect'>
 ): { access: Access; senderId: string } | null {
   if (!inbound.isDirect) return null;
-  const access = loadAccess();
-  if (pruneExpired(access)) saveAccess(access);
-  if (access.dmPolicy === 'disabled') return null;
-  if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(inbound.senderId)) return null;
-  return { access, senderId: inbound.senderId };
+  // Same reason as `gate()`: this one prunes and writes too.
+  return withFileLock(
+    ACCESS_FILE,
+    () => {
+      const access = loadAccess();
+      if (pruneExpired(access)) saveAccess(access);
+      if (access.dmPolicy === 'disabled') return null;
+      if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(inbound.senderId)) {
+        return null;
+      }
+      return { access, senderId: inbound.senderId };
+    },
+    { onWarn: log }
+  );
 }
 
 /**
