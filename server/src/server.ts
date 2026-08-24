@@ -109,6 +109,7 @@ import {
   readCredentials,
   updateEnvFile,
 } from './state.js';
+import { claimAccount, describeHolder, releaseAccount } from './account-lock.js';
 
 loadEnvFile();
 
@@ -145,6 +146,28 @@ try {
   // No pid file, not running, or `ps` unavailable (Windows). Carry on.
 }
 writeFileSync(PID_FILE, String(process.pid));
+
+// ── One bot per ACCOUNT ──────────────────────────────────────────────────────
+// The guard above is scoped to one STATE_DIR, so it cannot see a bot running
+// from a different channel directory on the same Matrix account — which is
+// exactly what happened on 2026-08-24 between this channel and the Claude Code
+// one, and what left the account with seven devices and an Olm identity no peer
+// could encrypt to. See server/src/account-lock.ts for the full account.
+//
+// Refusing to start is the correct outcome here and is not a fallback: a second
+// bot on one account corrupts state that cannot be repaired, only re-minted.
+const accountLock = claimAccount(creds.userId, creds.homeserverUrl, STATE_DIR, log);
+if (!accountLock.ok) {
+  const holder = describeHolder(accountLock.holder);
+  process.stderr.write(
+    `prinny channel: ${creds.userId} is already served by ${holder}.\n` +
+      `Two bots on one Matrix account duplicate every message and corrupt the\n` +
+      `crypto store — this one is refusing to start rather than join it.\n` +
+      `Stop the other channel, or give this one its own Matrix account.\n` +
+      `Lock: ${accountLock.path}\n`,
+  );
+  process.exit(1);
+}
 
 // Without these the process dies silently on any unhandled rejection. With
 // them it logs and keeps serving tools.
@@ -1183,6 +1206,7 @@ function shutdown(): void {
     if (Number.parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) {
       rmSync(PID_FILE, { force: true });
     }
+    releaseAccount(accountLock.path);
   } catch {
     // Already gone.
   }
