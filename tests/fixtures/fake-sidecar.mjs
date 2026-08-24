@@ -23,6 +23,14 @@
  *               sampling/createMessage) while a call is outstanding. Whatever
  *               the client sends back is echoed to stderr so a test can read
  *               it. See AK3.
+ *   stringid    echoes every id as a STRING. JSON-RPC allows it and asks only
+ *               that a server echo what it was sent; some implementations
+ *               stringify on the way out. The client sends numbers, so this is
+ *               the wire mismatch that used to drop every reply in silence.
+ *   unknownid   answers a tools/call with two messages the client has no home
+ *               for - a reply carrying an id nobody issued, and an `id: null`
+ *               parse-error response - both of which must be REPORTED rather
+ *               than dropped without trace.
  */
 
 const MODE = process.env.PRINNY_FAKE_MODE ?? 'normal';
@@ -30,6 +38,13 @@ const MODE = process.env.PRINNY_FAKE_MODE ?? 'normal';
 let buffer = '';
 
 function send(message) {
+  // `stringid` rewrites on the way out, so every reply in every phase of the
+  // protocol - handshake included - carries a stringified id. A mode that only
+  // affected tools/call would never exercise the handshake, which is the one
+  // call whose failure looks like a dead sidecar.
+  if (MODE === 'stringid' && message.id !== undefined && message.id !== null) {
+    message = { ...message, id: String(message.id) };
+  }
   const line = `${JSON.stringify(message)}\n`;
   if (MODE === 'split' && line.length > 8) {
     const cut = Math.floor(line.length / 2);
@@ -111,6 +126,15 @@ function handle(message) {
 
   if (method === 'tools/call') {
     if (MODE === 'silent') return;
+    if (MODE === 'unknownid') {
+      // Two shapes the client has no home for, and they take different
+      // branches: a well-formed reply to a request that was never made, and a
+      // message that is neither a method nor a matchable reply at all - which
+      // is what JSON-RPC says to send when a request could not even be parsed.
+      send({ jsonrpc: '2.0', id: 999999, result: { content: [] } });
+      send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } });
+      return;
+    }
     if (MODE === 'serverrequest') {
       // Not a reply — a REQUEST, wearing the id the client is waiting on.
       send({ jsonrpc: '2.0', id, method: 'ping', params: {} });

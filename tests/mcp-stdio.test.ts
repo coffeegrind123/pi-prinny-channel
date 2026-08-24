@@ -287,3 +287,68 @@ describe('a server-initiated request (AK3)', () => {
     expect(notifications.some((n) => n.method === 'notifications/claude/channel')).toBe(true);
   });
 });
+
+/**
+ * A reply whose id is a STRING, and a reply whose id is nobody's.
+ *
+ * JSON-RPC 2.0 allows a string, a number or null for `id`, and asks a server
+ * for one thing: echo back what it was sent. This client only ever sends
+ * numbers, so `typeof id === 'number'` covered every reply the sidecar in this
+ * repo has ever produced — and covered nothing else. A server that stringifies
+ * its ids on the way out answered `7` as `"7"`, the reply matched neither the
+ * `method` branch nor the id branch, and `dispatch` returned having done
+ * nothing at all. No log line, no rejection: the promise simply sat there until
+ * `requestTimeoutMs`, and the symptom was "the sidecar never answered" — which
+ * points the investigation at the sidecar rather than at the wire.
+ *
+ * `stringid` stringifies EVERY id including the handshake's, so the first
+ * assertion below is that `start()` itself survives. The old code would not
+ * have reached the second.
+ */
+describe('a reply whose id is not the number we sent', () => {
+  it('completes the handshake and the call when the sidecar stringifies ids', async () => {
+    const { child, stderr } = connect('stringid', { requestTimeoutMs: 4_000 });
+    await child.start();
+    expect(child.running).toBe(true);
+
+    const result = await child.callTool('reply', { text: 'hello' });
+    expect(resultText(result)).toContain('reply:');
+
+    // Handled is not the same as unremarkable: a server doing this is out of
+    // step with what we sent, and it is reported once so it is knowable.
+    const notes = stderr.join('');
+    expect(notes).toContain('echoes JSON-RPC ids as strings');
+  });
+
+  it('reports the string-id mismatch once, not once per call', async () => {
+    const { child, stderr } = connect('stringid', { requestTimeoutMs: 4_000 });
+    await child.start();
+    await child.callTool('reply', { text: 'one' });
+    await child.callTool('reply', { text: 'two' });
+    const occurrences = stderr.join('').split('echoes JSON-RPC ids as strings').length - 1;
+    expect(occurrences).toBe(1);
+  });
+
+  it('reports a reply it has no home for instead of dropping it', async () => {
+    // The reason the string coercion is conditional, and the reason the two
+    // dead ends now say so. `unknownid` answers with a perfectly well-formed
+    // reply carrying id 999999 - which nobody issued - and an `id: null` error.
+    const { child, stderr } = connect('unknownid', { requestTimeoutMs: 1_200 });
+    await child.start();
+
+    let rejected: Error | undefined;
+    await child.callTool('reply', { text: 'anything' }).catch((err: Error) => {
+      rejected = err;
+    });
+    expect(rejected?.message).toContain('tools/call timed out');
+
+    // BEFORE: both dropped without trace, on two different branches. The lines
+    // themselves are the evidence; neither claims to know WHY the id is
+    // unmatched, because that is the part most likely to be wrong.
+    await settle();
+    const notes = stderr.join('');
+    expect(notes).toContain('reply for request id 999999, which is not outstanding');
+    expect(notes).toContain('unrecognised message on the channel transport');
+    expect(notes).toContain('parse error');
+  });
+});

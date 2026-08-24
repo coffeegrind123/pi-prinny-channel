@@ -77,6 +77,9 @@ type Pending = {
 export class McpChild {
   private child: ChildProcessWithoutNullStreams | null = null;
   private readonly pending = new Map<number, Pending>();
+
+  /** One note per process about a server that stringifies ids. See replyKey(). */
+  private warnedStringId = false;
   /** Partial line left over from the last stdout chunk. */
   private stdoutBuffer = '';
   private stderrBuffer = '';
@@ -363,10 +366,37 @@ export class McpChild {
       return;
     }
 
-    const id = message.id;
-    if (typeof id === 'number') {
+    // A REPLY: an id and no method.
+    //
+    // JSON-RPC 2.0 allows a string, a number or null for `id` and asks a server
+    // for exactly one thing — echo back what it was sent. This client only ever
+    // sends numbers (`nextId++`), so a numeric id is the expected case. It is
+    // not the guaranteed one: a server that stringifies its ids, or any hop
+    // between us that round-trips them through something that does, answers `7`
+    // as `"7"`. That used to fall off the bottom of this function in complete
+    // silence — the promise stayed pending until `requestTimeoutMs`, and the
+    // failure surfaced as "the sidecar never answered", which points at the
+    // sidecar instead of at the wire.
+    //
+    // A string is accepted only when its integer form is ACTUALLY OUTSTANDING.
+    // Coercing unconditionally would let a server with a genuinely string-keyed
+    // id space collide with our counter, and resolving the wrong call is worse
+    // than not resolving one.
+    const id = this.replyKey(message.id);
+    if (id !== undefined) {
       const pending = this.pending.get(id);
-      if (!pending) return; // Reply to a request we already timed out.
+      if (!pending) {
+        // A reply for a request that is no longer outstanding: it timed out, it
+        // was already answered, or the id was never ours. This used to be a
+        // bare `return`, and all three read identically from the outside — a
+        // sidecar answering 200ms after its timeout looked exactly like one
+        // that never answered at all. Do not over-claim WHICH of the three it
+        // is; the line is the evidence.
+        this.options.onStderr(
+          `reply for request id ${id}, which is not outstanding: ${line.slice(0, 200)}\n`
+        );
+        return;
+      }
       this.pending.delete(id);
       clearTimeout(pending.timer);
       if (message.error) {
@@ -377,6 +407,41 @@ export class McpChild {
       }
       return;
     }
+
+    // NOTHING ELSE IS A THING WE UNDERSTAND, AND SAYING SO IS THE POINT.
+    //
+    // Before this branch existed, a message that was neither a method nor a
+    // matchable reply — `{"id": null, "error": ...}`, a reply carrying an id
+    // we never issued, anything a future protocol version adds — was dropped
+    // with no record that it had ever arrived. The evidence is the line itself,
+    // not a verdict about it.
+    this.options.onStderr(
+      `unrecognised message on the channel transport (no method, no matchable id): ${line.slice(0, 400)}\n`
+    );
+  }
+
+  /**
+   * The `pending` key a reply's raw id refers to, or undefined if it refers to
+   * none. See the comment at its only call site for why a string is accepted at
+   * all and why only a matching one is.
+   */
+  private replyKey(raw: unknown): number | undefined {
+    if (typeof raw === 'number') return raw;
+    if (typeof raw === 'string' && /^-?\d+$/.test(raw)) {
+      const n = Number(raw);
+      if (this.pending.has(n)) {
+        if (!this.warnedStringId) {
+          this.warnedStringId = true;
+          this.options.onStderr(
+            `note: the sidecar echoes JSON-RPC ids as strings (got ${JSON.stringify(raw)} for ` +
+              `a request sent as ${n}). Handled, and reported once — a mismatch here used to ` +
+              `hang every call until its timeout.\n`
+          );
+        }
+        return n;
+      }
+    }
+    return undefined;
   }
 
   private onStderrChunk(chunk: string): void {
