@@ -127,9 +127,23 @@ describe('AB2 — the wiring', () => {
     // Fourteenth pass (AE3): the entry is now folded into whatever the room
     // already had, rather than replacing it — see mergeAwaiting. The fact this
     // pins is unchanged: recorded first, watched second, sent third.
-    const set = source.indexOf('awaitingReply.set(');
-    const arm = source.indexOf('armDeliverySweep();');
-    const send = source.indexOf('api.sendUserMessage(text,');
+    //
+    // Scoped to `deliverInbound` (AP1). This used to index the WHOLE file, which
+    // was the same thing only for as long as the inbound path held the first
+    // `armDeliverySweep()` in it. `reattachSession` now also arms the sweep —
+    // correctly, since a detach clears the interval and a message can arrive
+    // between the two — and it sits with the lifecycle functions, above this
+    // one. The ordering this test is about was never file-wide; it is the order
+    // of three statements in one function, and now it says so.
+    const body = source.slice(
+      source.indexOf('function deliverInbound('),
+      source.indexOf('function runLocalCommand(')
+    );
+    assert.ok(body.length > 0, 'deliverInbound must precede runLocalCommand');
+
+    const set = body.indexOf('awaitingReply.set(');
+    const arm = body.indexOf('armDeliverySweep();');
+    const send = body.indexOf('api.sendUserMessage(text,');
 
     assert.ok(set > 0 && arm > set, 'the entry is recorded and then watched');
     assert.ok(arm < send, '"the send succeeded" is not observable, so the watch cannot depend on it');

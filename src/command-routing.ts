@@ -37,8 +37,7 @@
  *   share    publishes the session. The operator's local work is in it.
  *   export
  *   copy
- *   new      moves the operator to a different conversation, or ends theirs.
- *   fork
+ *   fork     moves the operator to a different conversation, or ends theirs.
  *   resume
  *   session
  *   tree
@@ -202,9 +201,44 @@ export const MATRIX_DEFAULT_SUBCOMMAND: Readonly<Record<string, string>> = {
  * split is the durable part: an entry here is a promise THIS FILE keeps, an entry
  * above is a promise pi keeps, and putting a built-in in the wrong table is the
  * mistake that was made.
+ *
+ * ## `new`, twenty-third pass (AP2) — a refusal that outlived its reason
+ *
+ * The denied list above used to carry `new` under
+ *
+ * > moves the operator to a different conversation, or ends theirs.
+ *
+ * That reasoning is about an operator sitting at a terminal whose session a
+ * remote sender could yank out from under them. It is the right call for a pi
+ * that a person is driving locally with a channel bolted on. It is the wrong
+ * call for the deployment this fork actually has, where the Matrix sender IS the
+ * operator and the terminal is a log they read afterwards — there, "start over"
+ * is the single most ordinary thing to want, and it was the one thing that could
+ * only be done by walking to the machine.
+ *
+ * It is on this table rather than `MATRIX_ALLOWED` for the same mechanical
+ * reason `/compact` is: `/new` is a pi BUILT-IN, dispatched by the TUI's own
+ * input handler, and `prompt()` resolves extension commands only. Routed through
+ * `MATRIX_ALLOWED` it would reach the model as the literal text `/new` — AC5's
+ * bug, on a second command.
+ *
+ * What it costs, stated because it is a real cost and not a hypothetical:
+ * `ctx.newSession()` runs `teardownCurrent`, whose first line is
+ * `await this.session.abort()`. A `/new` from Matrix therefore KILLS a turn the
+ * operator may have started in the terminal. That is not a side effect this
+ * table can design away — it is what `/new` means, and pi's own `/new` does
+ * exactly the same thing to exactly the same turn. The sender is told the turn
+ * was cancelled rather than left to infer it from the silence.
+ *
+ * What it does NOT cost, since AP1: the Matrix channel. `session_shutdown` with
+ * reason `new` now detaches instead of stopping, so the bot that was asked to
+ * start a new session is still logged in to say that it did. Before AP1 this
+ * entry could not have existed usefully — the reply confirming the reset would
+ * have been the first casualty of the reset.
  */
 export const MATRIX_LOCAL: Readonly<Record<string, string>> = {
   compact: "compact the conversation context",
+  new: "start a new session",
 };
 
 /**
@@ -343,6 +377,7 @@ export function advertisedCommands(): { command: string; description: string }[]
     { command: 'help', description: 'What this bot can do' },
     { command: 'status', description: 'Check your pairing status' },
     { command: 'compact', description: 'Compact the conversation context' },
+    { command: 'new', description: 'Start a new session — clears the conversation' },
     { command: 'stack', description: 'Show local model stack status' },
     { command: 'loop', description: 'Loop: goal, prepare, run, start, status, stop, finish' },
   ];

@@ -2057,3 +2057,160 @@ exactly ONE tool (`prinny`) and that its wire cost stays under the ceiling (an
 action fewer only shrinks it), and `tests/mcp-stdio.test.ts` still asserts the
 SIDECAR exposes a `reply` tool — the auto-forward path this pass deliberately
 left alone. 25/25 in those two suites, `node --check` clean.
+
+## AP1 — the channel that went down every time the conversation restarted
+
+`session_shutdown` had one handler and it did one thing:
+
+```
+  pi.on('session_shutdown', async () => {
+    await stopChannel();
+  });
+```
+
+The event carries a `reason`, and that handler never read it. Five things arrive
+through it — `quit`, `reload`, `new`, `resume`, `fork` — and only the first is
+the process going away. The other four are pi REPLACING the session inside a
+process that is still running, and for all four the sidecar was SIGTERM'd, the
+bot logged out of Matrix, and the Olm crypto store closed and reopened.
+
+**Measured**, with a stand-in sidecar delayed to the real cost of the
+matrix-js-sdk import (27.5 s — `src/config.ts` sets `connectTimeoutSeconds` to
+120 because of it):
+
+```
+  before   +40.06s  stopping the sidecar
+           +40.06s  sidecar exited (code null, signal SIGTERM)
+           +40.26s  [sidecar] importing matrix-js-sdk, 25000ms
+           +65.30s  sidecar handshake complete
+                    -> 25.1 s with no bot, pill reading "stopped" then "starting"
+
+  after    +40.07s  the session is being replaced (new); the Matrix channel stays up
+           +40.07s  session_start (new) with the channel already up — reattaching
+                    -> no stop, no restart, no downtime
+```
+
+A `/new` is a keystroke. Nothing about it is a reason to log a bot out of
+Matrix, and the outage is the mild half — the sidecar owns the crypto store,
+which `server/src/state.ts` says "must never be shared between two running
+bots", so every replacement was another close/reopen of the one piece of state
+here that cannot be repaired, only re-minted.
+
+**The rule** is in `src/session-scope.ts`, and the dividing question is not "is
+this a teardown" but **"does the module holding the sidecar handle survive it"**.
+`child` and `lifecycle` are module-level. Measured against pi's own loader:
+
+```
+  loadExtensionModule(path, cacheToken)
+    isCurrentCacheToken(cacheToken) -> extensionCache.get(path)     same instance
+    otherwise -> fresh jiti, moduleCache: false                     re-evaluated
+```
+
+`clearExtensionCache()` bumps the generation `isCurrentCacheToken` compares, and
+it has exactly one caller: `ResourceLoader.reload()`. So:
+
+- `new` / `resume` / `fork` — cache token unchanged, the SAME module instance is
+  handed to the replacement. Confirmed by probe against a real pi in `--mode rpc`:
+  one `module evaluated` line for three `new_session` commands, with a
+  module-scoped counter running 1..5 across them. **detach.**
+- `reload` — the module is re-evaluated and every binding in this extension is a
+  fresh one. A detach would orphan the sidecar and the replacement would spawn a
+  second bot onto the same store, which `server/src/account-lock.ts` refuses.
+  **stop.**
+- `quit` — the process is going. **stop.**
+- anything unrecognised — **stop**, which is what the code did before. Guessing
+  wrong towards `stop` costs thirty seconds; guessing wrong towards `detach`
+  costs unrepairable key state.
+
+`detachSession()` releases the session's half and nothing else: typing stopped, a
+deferred `/compact` abandoned, pending permissions denied (the operator asked to
+be consulted, and the session going away is not consent), and every unanswered
+`awaitingReply` entry told `replacedSessionMessage()` — a promise AB2 made that
+this path used to break in silence, since `undeliveredRooms` only ever fires for
+messages pi never took and this one it did. It never touches `child`,
+`lifecycle` or `shuttingDown`; `tests/session-scope.test.ts` asserts that on the
+function's source with comments stripped, because the body explains itself by
+naming `stopChannel` and a guard that fires on its own documentation is a guard
+nobody keeps.
+
+**Also measured, and it shapes `reattachSession`: pi emits `session_start` TWICE
+for one `/new`** — `bindExtensions` runs once in `createRuntime` and again in
+`finishSessionReplacement`. One `session_shutdown`, one factory call, two
+`session_start` events with reason `new`. Nothing on that path may accumulate.
+
+**Tests.** `tests/session-scope.test.ts`, 14 cases across four suites. One
+existing test moved rather than loosened: AB2's "arms the sweep when the message
+arrives" indexed the WHOLE file for the first `armDeliverySweep()`, which was
+the same thing only while the inbound path held it; `reattachSession` now also
+arms the sweep (a detach clears the interval and a message can arrive between
+the two) and sits above `deliverInbound`. The ordering it pins was never
+file-wide — it is three statements in one function, and it now says so.
+
+## AP2 — `/new` from Matrix, and the refusal that outlived its reason
+
+`command-routing.ts` refused `new` with:
+
+> moves the operator to a different conversation, or ends theirs.
+
+Right for a pi a person drives locally with a channel bolted on. Wrong for the
+deployment this fork has, where the Matrix sender IS the operator and the
+terminal is a log they read afterwards — there "start over" is the most ordinary
+thing to want, and it was the one thing that needed walking to the machine.
+
+It is in `MATRIX_LOCAL`, not `MATRIX_ALLOWED`, for AC5's mechanical reason:
+`/new` is a pi BUILT-IN, and `prompt()` resolves extension commands only, so
+routing it as `run` would deliver the literal text `/new` to the model.
+
+**The indirection, which is the part worth reading.** `ctx.newSession()` is
+declared on `ExtensionCommandContext`, not on `ExtensionContext` (pi's
+`core/extensions/types.d.ts`: `compact` at 246 on the base, `newSession` at 260
+on the command interface). `uiCtx` — the handle every async path here uses — is
+captured from `session_start` and `agent_start`, both of which hand out the BASE
+context. So the inbound path physically cannot call it, and a cast would be a
+cast onto a method that is not there.
+
+What pi WILL give an extension a command context for is an extension command,
+and it dispatches those from `sendUserMessage(…, expandPromptTemplates: true)`.
+`/prinny` is one. So the inbound handler asks pi to run `/prinny new`, and the
+command handler — which has the context — does the work. A Matrix sender cannot
+reach the dispatch form themselves: `prinny` is absent from `MATRIX_ALLOWED`, so
+`classifyMatrixCommand('/prinny new')` refuses it, and there is a test for that
+exact string.
+
+Handled in the command handler rather than in `handleCommand` because the
+subcommand replaces the session: by the time it returns, `pi` belongs to a
+torn-down runtime and the `appendEntry` at the bottom of that function would
+throw.
+
+**What it costs, stated because it is real:** `ctx.newSession()` runs
+`teardownCurrent`, whose first line is `await this.session.abort()`. A `/new`
+from Matrix kills a turn the operator may have started in the terminal. That is
+what `/new` means — pi's own does the same to the same turn — so the sender is
+told the turn was cancelled rather than left to infer it from silence.
+
+**What it no longer costs, since AP1:** the channel. The confirmation reply
+travels on `callSidecar`, which needs only `child`. Before AP1 this entry could
+not have existed usefully — the sentence confirming the reset would have been
+the first casualty of the reset. End to end against a real pi:
+
+```
+  inbound from @bob:example.org in !room:example.org
+  asking pi for a new session at !room:example.org's request
+  replacing the session at !room:example.org's request
+  the session is being replaced (new); the Matrix channel stays up
+  session_start (new) with the channel already up — reattaching
+  the session was replaced; the Matrix channel carried over
+  [sidecar] OUTBOUND reply {"room_id":"!room:example.org","text":"Started a new
+            session — the conversation is cleared … I am still connected here"}
+```
+
+`server/src/server.ts`'s `COMMANDS` gains the entry too — that is the list a
+Matrix client's `/` menu actually reads; `advertisedCommands()` in
+`src/command-routing.ts` is a second copy with no caller in this fork, updated
+to match so the two do not drift.
+
+**Tests.** Three new cases in `tests/command-routing.test.ts`: `/new` classifies
+as `local` for the same reason `/compact` does, the dispatch form `/prinny new`
+is refused from Matrix, and — because a list like this widens quietly at its
+edges — the neighbours `/fork`, `/resume`, `/quit`, `/session` and `/tree` are
+still refused. 593/593 unit, 5/5 e2e.

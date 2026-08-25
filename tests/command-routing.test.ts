@@ -42,6 +42,30 @@ describe('classifyMatrixCommand — what runs', () => {
     });
   });
 
+  /**
+   * AP2. `/new` is the second entry in MATRIX_LOCAL and it is there for the same
+   * mechanical reason as the first — a pi built-in is not something `prompt()`
+   * will dispatch — not because the two commands resemble each other.
+   */
+  it('marks /new as local too, for the same reason as /compact', () => {
+    expect(classifyMatrixCommand('/new')).toEqual({
+      kind: 'local',
+      name: 'new',
+      text: '/new',
+    });
+  });
+
+  /**
+   * The route AP2 actually uses: the extension asks pi to run one subcommand of
+   * `/prinny`, because that IS an extension command and its handler gets the
+   * command context `newSession` lives on. That door must stay one-way — a
+   * sender who types the dispatch form themselves has to be refused, or the
+   * whole of the `prinny` refusal above is decoration.
+   */
+  it('refuses the /prinny subcommand the extension dispatches to itself', () => {
+    expect(classifyMatrixCommand('/prinny new').kind).toBe('refuse');
+  });
+
   it('every allow-listed command is an EXTENSION command pi can actually dispatch', () => {
     // The whole of AC5 in one assertion: an entry in MATRIX_ALLOWED is a promise
     // pi keeps, and pi keeps it only for commands something calls
@@ -108,7 +132,6 @@ describe('classifyMatrixCommand — what is refused', () => {
       'share',
       'export',
       'copy',
-      'new',
       'fork',
       'resume',
       'session',
@@ -117,6 +140,20 @@ describe('classifyMatrixCommand — what is refused', () => {
       'model',
       'name',
     ]) {
+      expect(classifyMatrixCommand(`/${name}`).kind).toBe('refuse');
+    }
+  });
+
+  /**
+   * AP2 moved `new` off the list above deliberately, so this states what did NOT
+   * move with it. `/new` replaces the sender's own conversation; the three below
+   * reach past it — `/fork` and `/resume` put the operator in a DIFFERENT
+   * conversation of their choosing, and `/quit` ends the process. Sharing a
+   * boundary with a command that was just opened is exactly where a list like
+   * this quietly widens, so the neighbours get their own test.
+   */
+  it('opening /new did not open the commands next to it', () => {
+    for (const name of ['fork', 'resume', 'quit', 'session', 'tree']) {
       expect(classifyMatrixCommand(`/${name}`).kind).toBe('refuse');
     }
   });

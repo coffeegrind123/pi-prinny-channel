@@ -129,6 +129,11 @@ import {
   undeliveredRooms,
   type UnansweredReason,
 } from '../src/delivery.ts';
+import {
+  replacedSessionMessage,
+  shutdownDisposition,
+  startDisposition,
+} from '../src/session-scope.ts';
 import { renderInboundMessage, roomOf, uniqueInjection, type ChannelMessage } from '../src/inbound.ts';
 import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
@@ -552,6 +557,104 @@ async function stopChannel(): Promise<void> {
   shuttingDown = false;
 }
 
+/**
+ * The other half of `stopChannel`: everything it releases EXCEPT the sidecar.
+ *
+ * Twenty-third pass (AP1). `/new`, `/resume` and `/fork` replace the session
+ * inside a process that is still running, and until this pass all three went
+ * through `stopChannel` — logging the bot out of Matrix, closing the Olm store
+ * and paying 27.5 s to import matrix-js-sdk again, for a conversation reset that
+ * has nothing to do with Matrix. `../src/session-scope.ts` holds the rule and
+ * the measurement; this is what it dispatches to.
+ *
+ * Every line below is a line `stopChannel` also runs, and for the same reason —
+ * the difference is only that here the sidecar is still there afterwards, which
+ * makes the promises *easier* to keep rather than harder. Ordering therefore
+ * matters less than it does over there, but it is kept identical so the two can
+ * be read against each other.
+ *
+ * What is deliberately NOT here: `shuttingDown`, `child`, `lifecycle`. A detach
+ * is not a stop, and a start in flight for this PROCESS must not be cancelled by
+ * a session ending — that start is bringing up the channel the replacement
+ * session is about to inherit.
+ */
+function detachSession(reason: string): void {
+  log(`the session is being replaced (${reason}); the Matrix channel stays up`);
+
+  // AL6's argument, unchanged: `stopTyping()` is not bookkeeping, its whole body
+  // is outbound `typing: false` calls. The session that was composing an answer
+  // is going; leaving the indicator up would show a bot still writing a reply
+  // that no longer has an author.
+  stopTyping();
+  abandonPendingCompaction();
+
+  for (const [id, pending] of pendingPermissions) {
+    clearTimeout(pending.timer);
+    pendingPermissions.delete(id);
+    // The same call `stopChannel` makes, for the same reason: the operator asked
+    // to be consulted, and the session going away is not consent.
+    pending.resolve('deny');
+  }
+
+  // AB2's promise, kept on the one path that used to break it in silence. An
+  // entry here is a Matrix message pi accepted and has not answered; the session
+  // that owed the answer is being destroyed, so no later sweep can resolve it —
+  // `undeliveredRooms` only ever fires for messages pi never took, and this one
+  // it did take. Told now, while the sidecar is reachable and the fact is known
+  // exactly, rather than left to expire as silence.
+  for (const [room, entry] of awaitingReply) {
+    if (entry.answered) continue;
+    log(`the session was replaced with ${room}'s message unanswered — saying so`);
+    void callSidecar('reply', { room_id: room, text: replacedSessionMessage() }).catch((err) =>
+      log(`could not tell ${room} that the session was replaced: ${err}`)
+    );
+  }
+  awaitingReply.clear();
+
+  // Run-scoped state, all of it about a run that will never finish. Left behind,
+  // every one of these is a claim about the new session that came from the old:
+  // `alreadySent` would suppress a forward that has not happened in this session,
+  // `lastAssistantText` would be offered as this session's answer, and
+  // `lastRunEmptyEnding` would have `agent_settled` diagnose a turn that belonged
+  // to somebody else.
+  alreadySent.clear();
+  unattributableThisRun = false;
+  lastAssistantText = '';
+  lastRunEmptyEnding = { empty: false };
+  lastInbound = {};
+  agentRunning = false;
+
+  if (deliveryTimer) {
+    clearInterval(deliveryTimer);
+    deliveryTimer = undefined;
+  }
+}
+
+/**
+ * A `session_start` that arrives on a channel which never went away.
+ *
+ * The counterpart to `detachSession`, and it is mostly a matter of re-pointing
+ * the things that are per-SESSION at the new one. `uiCtx` and the tool
+ * registration are done by the caller (they are done for a cold start too); what
+ * is left is the status pill, which lives in the session's own UI and is
+ * therefore blank on a session that has just opened — so a carried-over channel
+ * would show NO pill at all until the next thing that happened to set one.
+ *
+ * Idempotent on purpose. pi emits `session_start` **twice** for one `/new` —
+ * measured against a real pi in `--mode rpc`: one `session_shutdown`, one
+ * factory call, then two `session_start` events with reason `new` back to back
+ * (`bindExtensions` runs once in `createRuntime` and again in
+ * `finishSessionReplacement`). Nothing here may assume it runs once.
+ */
+function reattachSession(reason: string): void {
+  log(`session_start (${reason}) with the channel already up — reattaching`);
+  setStatus(connected ? 'prinny: connected' : 'prinny: starting');
+  // A message can arrive between the detach and here, and the sweep is armed on
+  // arrival rather than on success (see `deliverInbound`). Re-armed rather than
+  // assumed, because `detachSession` cleared the interval.
+  if (sweepHasWork(awaitingReply.entries())) armDeliverySweep();
+}
+
 function requireChannel(): McpChild {
   if (!child?.running) {
     throw new Error(
@@ -766,9 +869,14 @@ function runLocalCommand(name: string, room: string): void {
       log(`could not reply to ${room} after /${name}: ${err}`)
     );
 
+  if (name === 'new') {
+    requestNewSession(room, reply);
+    return;
+  }
+
   if (name !== 'compact') {
-    // Unreachable while MATRIX_LOCAL has one entry; stated so that adding a
-    // second one without a branch fails loudly rather than silently.
+    // Unreachable while MATRIX_LOCAL has two entries; stated so that adding a
+    // third one without a branch fails loudly rather than silently.
     log(`no local handler for /${name}`);
     reply(`/${name} is not available from Matrix. Run it in the terminal.`);
     return;
@@ -797,6 +905,123 @@ function runLocalCommand(name: string, room: string): void {
   }
 
   startCompaction([room]);
+}
+
+// ── /new from Matrix ─────────────────────────────────────────────────────────
+
+/**
+ * The `/prinny` subcommand the extension dispatches to ITSELF.
+ *
+ * Twenty-third pass (AP2), and the indirection is not decoration — it is the
+ * only route to the one thing this needs.
+ *
+ * `ctx.newSession()` is declared on `ExtensionCommandContext`, not on
+ * `ExtensionContext` (pi's `core/extensions/types.d.ts`: `compact` is on the
+ * base interface at line 246, `newSession` is on the command interface at 260).
+ * `uiCtx` — the handle every async path in this file uses — is captured from
+ * `session_start` and `agent_start`, both of which hand out the BASE context. So
+ * the inbound path physically cannot call it, and reaching for `uiCtx as
+ * ExtensionCommandContext` would be a cast onto a method that is not there.
+ *
+ * What pi will give an extension a command context for is an extension command,
+ * and it dispatches those from `sendUserMessage(..., expandPromptTemplates: true)`
+ * — AC5's finding read forwards instead of backwards. `/prinny` is an extension
+ * command. So the inbound handler asks pi to run one subcommand of it, and the
+ * command handler, which has the context, does the work.
+ *
+ * A Matrix sender cannot reach this by typing it: `prinny` is absent from
+ * `MATRIX_ALLOWED`, so `classifyMatrixCommand` refuses `/prinny anything` before
+ * it is dispatched. The door this opens is one command wide and this file is
+ * standing in it.
+ */
+const NEW_SESSION_SUBCOMMAND = 'new';
+
+/**
+ * Which room asked for the session that is about to be replaced.
+ *
+ * Module-level because the reply happens on the far side of the replacement,
+ * and the entry in `awaitingReply` that would otherwise carry it is cleared by
+ * `detachSession` on the way through. Module state survives a session
+ * replacement — measured, see `../src/session-scope.ts` — which is the same
+ * fact the whole of AP1 rests on.
+ */
+let newSessionRequest: { room: string; at: number } | undefined;
+
+/** Ask pi to replace the session, on behalf of a Matrix sender. */
+function requestNewSession(room: string, reply: (text: string) => void): void {
+  if (!api) {
+    log('cannot start a new session: no extension API yet');
+    reply('I could not start a new session — this session is not ready yet. Please try again in a moment.');
+    return;
+  }
+
+  newSessionRequest = { room, at: Date.now() };
+  log(`asking pi for a new session at ${room}'s request`);
+  try {
+    // Not `settings.deliverAs`. An extension command is executed the moment
+    // `prompt()` sees it — "Extension commands: if the message is an extension
+    // command, it executes immediately even during streaming" (pi's own
+    // `docs/rpc.md`) — so the queueing modes do not apply to it, and naming one
+    // here would suggest a choice that is not being made.
+    api.sendUserMessage(`/prinny ${NEW_SESSION_SUBCOMMAND}`, { expandPromptTemplates: true });
+  } catch (err) {
+    newSessionRequest = undefined;
+    log(`could not dispatch /prinny ${NEW_SESSION_SUBCOMMAND}: ${err}`);
+    reply('I could not start a new session — the request did not reach the session. Please try again.');
+  }
+}
+
+/**
+ * Replace the session, and tell the room that asked.
+ *
+ * Runs in the `/prinny` command handler, which is the only place with a context
+ * that has `newSession`. Everything it reports is something it can actually
+ * observe: whether a turn was cancelled (read BEFORE the call, because
+ * `newSession` aborts and `detachSession` then clears the flag), and whether an
+ * extension vetoed the replacement through `session_before_switch`.
+ *
+ * The reply goes out through `callSidecar`, which needs only `child` — not
+ * `api`, not `uiCtx`, both of which belong to the session this just destroyed.
+ * That is the whole point of AP1: before it, the channel went down with the
+ * session and this sentence had nothing to travel on.
+ */
+async function runNewSession(ctx: ExtensionCommandContext): Promise<void> {
+  const request = newSessionRequest;
+  newSessionRequest = undefined;
+  const cancelledATurn = agentRunning;
+
+  const reply = (text: string) => {
+    if (!request) return;
+    void callSidecar('reply', { room_id: request.room, text }).catch((err) =>
+      log(`could not confirm the new session to ${request.room}: ${err}`)
+    );
+  };
+
+  log(`replacing the session${request ? ` at ${request.room}'s request` : ''}`);
+  let result: { cancelled: boolean };
+  try {
+    result = await ctx.newSession();
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    log(`the new session failed: ${detail}`);
+    reply(`I could not start a new session: ${detail}. The conversation is unchanged.`);
+    return;
+  }
+
+  if (result.cancelled) {
+    // `session_before_switch` can veto, and something in this stack may one day
+    // do so. Reported as the refusal it is rather than as a success.
+    log('the new session was cancelled by an extension');
+    reply('Something in the session refused to start a new one, so the conversation is unchanged.');
+    return;
+  }
+
+  log('the session was replaced; the Matrix channel carried over');
+  reply(
+    'Started a new session — the conversation is cleared and I have forgotten what we were doing. ' +
+      (cancelledATurn ? 'The turn that was running was cancelled. ' : '') +
+      'I am still connected here; go ahead.'
+  );
 }
 
 /**
@@ -1799,6 +2024,9 @@ const HELP = `/prinny — Matrix channel
 
   /prinny                       status: connection, access policy, settings
   /prinny start | stop | restart
+  /prinny new                   replace the session, keeping the channel up
+                                (what a Matrix /new dispatches; pi's own /new
+                                does the same to the session either way)
   /prinny prepare               build the Matrix runtime (~1 min, once)
   /prinny log [lines]           tail the channel log
 
@@ -2213,6 +2441,7 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext): Promis
 const SUBCOMMANDS = [
   'status',
   'help',
+  'new',
   'start',
   'stop',
   'restart',
@@ -2277,6 +2506,18 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
     },
     handler: async (args, ctx) => {
       uiCtx = ctx;
+
+      // AP2: handled HERE rather than inside `handleCommand`, and the reason is
+      // the line at the bottom of this function. This subcommand replaces the
+      // session, so by the time it returns `pi` belongs to a runtime that has
+      // been torn down and `appendEntry` throws on it. Everything else in
+      // `handleCommand` returns text for that call; this one returns a different
+      // session.
+      if (tokenize(args)[0] === NEW_SESSION_SUBCOMMAND) {
+        await runNewSession(ctx);
+        return;
+      }
+
       let output: string;
       try {
         output = await handleCommand(args, ctx);
@@ -2288,18 +2529,43 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
     },
   });
 
-  pi.on('session_start', async (_event, ctx) => {
+  pi.on('session_start', async (event, ctx) => {
     uiCtx = ctx;
     settings = readSettings();
     // Credentials that appeared between two sessions — a hand-edited `.env`, or
     // a `/prinny configure` in a session that has since been replaced. AK1.
     ensureToolsRegistered(pi);
+
+    // AP1: the channel outlives a session replacement, so this is now two cases.
+    // `startChannel()` was already a no-op on a running channel — `if
+    // (child?.running) return` has always been its first line — so the reattach
+    // arm is not about avoiding a second sidecar. It is about the pill and the
+    // sweep, neither of which a returning `startChannel` would touch, and about
+    // saying in the log which of the two happened.
+    const reason = String((event as { reason?: unknown }).reason ?? 'startup');
+    if (startDisposition(reason, Boolean(child?.running)) === 'reattach') {
+      reattachSession(reason);
+      return;
+    }
     // Fire and forget: a session must not wait on a homeserver to become
     // usable, and the sidecar reports its own progress through notify().
     void startChannel();
   });
 
-  pi.on('session_shutdown', async () => {
+  /**
+   * AP1: five reasons arrive here and only two of them are the channel ending.
+   *
+   * The handler used to be `await stopChannel()` with the event ignored. See
+   * `../src/session-scope.ts` for which reason goes which way, why `reload` is
+   * on the same side as `quit` despite looking like a replacement, and what was
+   * measured to decide it.
+   */
+  pi.on('session_shutdown', async (event) => {
+    const reason = String((event as { reason?: unknown }).reason ?? 'unknown');
+    if (shutdownDisposition(reason) === 'detach') {
+      detachSession(reason);
+      return;
+    }
     await stopChannel();
   });
 

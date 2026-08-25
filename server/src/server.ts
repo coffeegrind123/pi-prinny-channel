@@ -352,6 +352,7 @@ const COMMANDS = [
   { command: 'help', description: 'What this bot can do' },
   { command: 'status', description: 'Check your pairing status' },
   { command: 'compact', description: 'Compact the conversation context' },
+  { command: 'new', description: 'Start a new session — clears the conversation' },
   { command: 'stack', description: 'Show local model stack status' },
   { command: 'loop', description: 'Loop: goal, prepare, run, start, status, stop, finish' },
 ];
