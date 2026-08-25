@@ -2009,3 +2009,51 @@ packages' copies** over six values and asserts one answer each.
 **550, up from 511.** And they now refuse to run at all against a staged runtime
 that is not this checkout (AO5), so the number is a statement about the sidecar
 in the tree rather than about whatever was last compiled.
+
+## AO6 — the `reply` action disabled: redundant with auto-forward, and broken
+
+Operator request (2026-08-26), not a found bug — but it had one. The
+model-callable `reply` action (the `reply` entry in the `ACTIONS` map in
+`extensions/index.ts`) is commented out, left in place with a reason.
+
+Two grounds, and the first is the whole design already saying so. A turn's
+written answer is delivered to the sender by `forwardToMatrix` on its own — the
+tool's own description opens with *"Your ordinary written answer is already
+delivered to the sender, so you do not need this to reply."* So for a plain
+reply the action was never the path; it was a second way to do the one thing
+that already happens for free, and a model that both wrote an answer and called
+`reply` with it is exactly what `alreadySent.mark` exists to de-duplicate.
+
+The second ground is that it did not work. `prinny(action:reply, {…})` from the
+model produced:
+
+```
+reply failed: The "path" argument must be of type string or an instance of
+Buffer or URL. Received an instance of Object
+```
+
+— a bad-shaped args payload reaching the sidecar's file handling. So disabling
+the action removes nothing that functioned.
+
+**What is NOT touched, and why this is safe.** The internal
+`child.callTool('reply', …)` inside `forwardToMatrix` (extensions/index.ts,
+~line 1023) is a DIFFERENT code path from the model action: it passes a clean
+`{ room_id, text, reply_to? }`, which is why auto-forward never hit the bug. It
+stays live, and the sidecar's own `reply` tool is unchanged — so the delivery
+of written answers is exactly as before. Only the map entry the model sees is
+gated; `execute()`'s `params.action === 'reply'` branch becomes dead code but
+harmless. The two hardcoded prompt strings that advertised `reply` /
+`quote-reply` / attaching a file (`promptSnippet` and the first
+`promptGuidelines` line) were trimmed to match; `describeActions()` drops the
+row on its own because it reads the map.
+
+**Re-enable** by uncommenting the map entry once the sidecar reply payload is
+fixed and there is a real need beyond auto-forward (attachments, or a deliberate
+second message).
+
+**Tests.** No new test — this is a config gate, not a code path. Existing suites
+still hold: `tests/tool-budget.test.ts` still asserts the channel registers
+exactly ONE tool (`prinny`) and that its wire cost stays under the ceiling (an
+action fewer only shrinks it), and `tests/mcp-stdio.test.ts` still asserts the
+SIDECAR exposes a `reply` tool — the auto-forward path this pass deliberately
+left alone. 25/25 in those two suites, `node --check` clean.
