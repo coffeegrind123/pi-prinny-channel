@@ -30,7 +30,15 @@ import {
   releaseAccount,
 } from '../server/src/account-lock.ts';
 
-const USER = '@openclaude:struct.ws';
+// Synthetic, and unique per run. This used to be the real `@openclaude:struct.ws`
+// — the account the incident in the header happened on — which meant the suite
+// took the lock on a LIVE account and failed outright on any machine where the
+// channel was actually running: `claimAccount` refused the first claim, because a
+// real sidecar held it, and two tests reported a broken lock while watching the
+// lock work. A test that fails for an environmental reason is a test people
+// learn to ignore. The path is a hash of user+homeserver, so any id exercises
+// the same code; a real one only buys collisions.
+const USER = `@prinny-test-${process.pid}:struct.ws`;
 const HS = 'https://struct.ws:8448';
 
 function freshDir(): string {
@@ -62,7 +70,7 @@ describe('account lock', () => {
 
   it('a different account is not blocked', () => {
     const a = claimAccount(USER, HS, freshDir());
-    const b = claimAccount('@someone-else:struct.ws', HS, freshDir());
+    const b = claimAccount(`@prinny-test-other-${process.pid}:struct.ws`, HS, freshDir());
     try {
       assert.equal(a.ok, true);
       assert.equal(b.ok, true, 'the lock must not be global');
