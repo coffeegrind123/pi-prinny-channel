@@ -2537,9 +2537,24 @@ consumer of `description` is the **server browser listing**
 would duplicate the display name AQ3 already sets. Worth a one-off call for
 completeness; not worth wiring to the persona.
 
-**`setChatMenuButton`** — genuinely rendered (`BotMenuButton`), and worth doing.
-Not in this change because it is a different feature with a different failure
-mode, and bundling it would have made the rate-limit work harder to review.
+**`setChatMenuButton`** — written up here first as "genuinely rendered, and worth
+doing". **That was wrong, and reading the client settles it.** `BotMenuButton`
+computes its own fallback:
+
+```ts
+  if (urlButton) return urlButton;
+  return hasCommands ? { type: 'commands' } : null;
+```
+
+…where `hasCommands` is true when `info.commands?.length > 0`. This channel
+publishes seven commands through `setMyCommands`, so the client **already**
+renders the commands menu button. Calling `setChatMenuButton({type:'commands'})`
+would set a field whose only effect the client already infers — a no-op dressed
+as a feature.
+
+The one thing it could add is `{type:'url', text, url}`, and a coding-agent
+channel has no natural URL to point at. So: not built, and not queued. If a
+reason for a URL button ever appears, that is the moment to add it.
 
 Confirmed the same way: the commands we already publish via `setMyCommands` are
 what earn the **BOT badge** and the `/`-autocomplete, so that half was already
