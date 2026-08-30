@@ -2260,19 +2260,44 @@ again:
 | a `user` message ends the walk | that is the sender's own question; above it is an earlier exchange, and is not theirs |
 | `text` blocks only | the allowlist, so `thinking` and a content kind pi has not shipped yet are excluded by default |
 
-### What this widens, said plainly
+### What this widens — corrected against the session file
 
-Every text the model emits in the run now reaches Matrix, **including text it
-wrote to itself**. Two of the five messages above are things the sender should
-never see — a planning note and a remark about having already sent something.
-Neither is a `thinking` block, so no allowlist in this package can catch them:
-they arrived as ordinary assistant text.
+The transcript above is a terminal paste, and it was first read as showing two
+messages the sender should never see: a planning note ("Hi, this is a simple
+greeting in the persona…") and a remark about having already sent something. On
+that reading they were ordinary assistant text, no allowlist could catch them,
+and widening the forward would have leaked both. **That reading was wrong**, and
+the operator was warned on the strength of it before anyone opened the session
+file.
 
-That is a violation of the persona contract (`vendor/pi-persona`'s hedge pattern
-3, "stepping outside the persona") rather than of this package, and the fix for
-it belongs in the prompt. **This was the trade the operator was offered and
-took**, with the leak named first. Recorded here so that a later reader does not
-find the widening and assume nobody looked.
+The session JSONL says what the blocks actually are:
+
+```
+  text(229)    "*ears perk up and flick* H-hi there, master! …"
+  thinking(219)"The user sent \"hai\" from the Matrix. A casual greeting. …"
+  toolCall     prinny
+  ---
+  thinking(60) "Reacted. Nothing more to add—the response was already sent."
+  text(76)     "*waves back* H-here whenever you want me, okay? …"
+```
+
+Both of the worrying lines are **`thinking` blocks**. `assistantTextOfMessage`
+is an allowlist on `type === "text"`, so neither has ever been forwardable and
+neither becomes forwardable now. The incident itself is unchanged and the fix is
+unchanged — the greeting really was dropped, and it really was because
+`finalAssistantText` returns the last text — but the cost of fixing it is not
+what it was first written up as.
+
+**What widening actually costs is length, not leakage.** Every in-character
+progress line the model writes between tool calls is now forwarded: "Page loaded,
+*ears perk* — let me see what's in there", "404, huh… *tilts head*". On a long
+agentic run that is a lot of lines arriving as one message when the run settles.
+For a sender who wants to follow along that is the point; for one who wants an
+answer it is noise, and `forward: "last"` is still there for them.
+
+The general lesson is the one this repo already has written down: a terminal
+paste renders `thinking` and `text` the same way, and the session file does not.
+Read the file.
 
 ### The duplicate the split exists to prevent
 
