@@ -124,9 +124,25 @@ export type PermissionMode = 'off' | 'dangerous' | 'all';
  */
 export type ForwardMode = 'off' | 'result' | 'last' | 'all';
 
+/** Whether the bot wears the active persona's name and face. */
+export type PersonaProfileMode = 'on' | 'off';
+
 export type PiSettings = {
   deliverAs: DeliverAs;
   forward: ForwardMode;
+  /**
+   * Mirror the bot's Matrix display name and avatar to the active persona.
+   *
+   * `vendor/pi-persona` writes the persona and stores the card's image URL in
+   * its `meta.json`; this reads both off disk (packages here do not import each
+   * other) and drives the sidecar's `set_profile`. Cleared personas restore the
+   * display name the bot had before any persona was applied.
+   *
+   * On by default. The channel exists so somebody can talk to this session from
+   * their phone, and a bot called `pi` with no avatar answering in character is
+   * the confusing half of that.
+   */
+  personaProfile: PersonaProfileMode;
   permissionMode: PermissionMode;
   /** Extra tool names always gated, whatever the mode. */
   permissionTools: string[];
@@ -167,6 +183,7 @@ export const DEFAULT_SETTINGS: PiSettings = {
   // `all`, not `result`, changed 2026-08-30. See ForwardMode above for what the
   // modes are and FORK.md AQ2 for why the default moved.
   forward: 'all',
+  personaProfile: 'on',
   permissionMode: 'off',
   permissionTools: [],
   permissionTimeoutSeconds: 300,
@@ -176,6 +193,7 @@ export const DEFAULT_SETTINGS: PiSettings = {
 
 const DELIVER_AS: DeliverAs[] = ['followUp', 'steer'];
 const FORWARD_MODES: ForwardMode[] = ['off', 'result', 'last', 'all'];
+const PERSONA_PROFILE_MODES: PersonaProfileMode[] = ['on', 'off'];
 const PERMISSION_MODES: PermissionMode[] = ['off', 'dangerous', 'all'];
 
 /**
@@ -223,6 +241,7 @@ function coerceSettings(raw: Record<string, unknown>): PiSettings {
   return {
     deliverAs: asEnum(raw.deliverAs, DELIVER_AS, DEFAULT_SETTINGS.deliverAs),
     forward: asEnum(raw.forward, FORWARD_MODES, DEFAULT_SETTINGS.forward),
+    personaProfile: asEnum(raw.personaProfile, PERSONA_PROFILE_MODES, DEFAULT_SETTINGS.personaProfile),
     permissionMode: asEnum(raw.permissionMode, PERMISSION_MODES, DEFAULT_SETTINGS.permissionMode),
     permissionTools: Array.isArray(raw.permissionTools)
       ? raw.permissionTools.filter((name): name is string => typeof name === 'string')
@@ -247,6 +266,7 @@ export type SettingKey = keyof PiSettings;
 export const SETTING_KEYS: SettingKey[] = [
   'deliverAs',
   'forward',
+  'personaProfile',
   'permissionMode',
   'permissionTools',
   'permissionTimeoutSeconds',
@@ -278,6 +298,10 @@ export function parseSetting(
       return FORWARD_MODES.includes(value as ForwardMode)
         ? { ok: true, key, value: value as ForwardMode }
         : bad(FORWARD_MODES.join(' | '));
+    case 'personaProfile':
+      return PERSONA_PROFILE_MODES.includes(value as PersonaProfileMode)
+        ? { ok: true, key, value: value as PersonaProfileMode }
+        : bad(PERSONA_PROFILE_MODES.join(' | '));
     case 'permissionMode':
       return PERMISSION_MODES.includes(value as PermissionMode)
         ? { ok: true, key, value: value as PermissionMode }

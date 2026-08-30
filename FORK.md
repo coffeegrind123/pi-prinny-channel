@@ -2399,3 +2399,66 @@ blocks in it; none of them can reach Matrix under any setting here.
 `tests/config.test.ts` pins both new defaults and adds a thinking-exclusion
 assertion beside them, because the default moving to `all` is exactly the moment
 somebody would assume otherwise. 603 tests, up from 601.
+
+## AQ3 — the bot wears the persona's name and face
+
+openclaude mirrors its Matrix bot's display name and avatar to the active
+`/identity` persona. This package carried the ingredients for that and never used
+them: `vendor/pi-persona` stores the card's image URL in `meta.json` — it is kept
+at fetch time precisely so it does not have to be re-fetched — and nothing read
+it. The FORK.md for that package said so, under "what this package does NOT do".
+
+Now it does. `personaProfile` (default `on`,
+`/prinny set personaProfile off` to stop):
+
+```
+  persona active   display name = the persona's name, avatar = the card image
+  persona cleared  display name restored, avatar cleared
+```
+
+### Read across, do not import
+
+`vendor/pi-persona` owns `PERSONA.md` and `personas/<slug>/meta.json`. Vendor
+packages in the origin stack must not import each other — the constraint that
+gives the compaction lock three copies of its protocol and `rtk-pi` its own
+spelling of the approved-command key — so `src/persona-profile.ts` reads the
+*files*, and `tests/persona-profile.test.ts` asserts the two packages still agree
+about their names, about the framing sentence the display name is parsed out of,
+and that `meta.json` still carries `avatarUrl` at all. That last one matters:
+if `pi-persona` stopped storing it, this feature would silently do half its job.
+
+openclaude's `IDENTITY.md` / `identities/` names are read too, so a library
+copied from there still produces a face.
+
+### The parts that needed care
+
+- **Matrix will not take an http URL as an avatar.** The card's image has to be
+  fetched and re-uploaded to the homeserver once, for an `mxc://`. Bounded at
+  8 MB and 20 s, refused unless the content type is an image, and the
+  `content_uri` is checked to actually start with `mxc://` — the SDK's return
+  shape differs across versions, and a wrong assumption there sets somebody's
+  avatar to `[object Object]`.
+- **An avatar failure must not cost the display name.** They are separate
+  `try`s: a homeserver refusing a 413 should not leave the bot nameless.
+- **The default name is captured on FIRST APPLICATION, not at connect.** At
+  connect the channel may already be wearing a persona from a previous session,
+  and "the name before any persona" would then capture the persona — making
+  "clear" restore the wrong thing, permanently.
+- **`set_profile` with no arguments is a pure read**, returning the profile as
+  JSON. That is how the extension learns the name to put back, without a second
+  tool and without parsing a human sentence.
+- **Not registered with pi**, like `typing`. It costs the model no schema, and
+  the model has no business editing the persona files anyway.
+- **Called on every settled run**, because the persona is written by the model
+  *between* turns and there is no event to hang it on. `profileChanged()` makes
+  the common case two `stat`s and no network.
+
+### The AO5 guard caught this being built
+
+Editing `server/src/server.ts` made the staged runtime stale, and 76 tests across
+14 suites failed at once — every suite that loads the COMPILED sidecar. That is
+`assertRuntimeMatchesSource` doing exactly its job: refusing to report a green
+run about a program that is not in the tree. `npm run prepare-runtime` and they
+pass. Worth recording as the guard working rather than as a wobble.
+
+620 tests, up from 603.

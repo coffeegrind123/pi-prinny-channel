@@ -68,6 +68,21 @@ way out, which holds at frontier scale and does not at 27B: the model writes a
 good answer into the transcript, never calls the tool, and the person on Matrix
 sees nothing while the operator sees a complete reply.
 
+## Wearing the persona
+
+With [pi-persona](https://github.com/coffeegrind123/pi-persona) installed, the
+bot takes the active persona's name and the card's image as its Matrix display
+name and avatar, so the person on the other end sees who they are talking to
+rather than a bot called `pi`. Clearing the persona puts the original name back.
+
+```
+/prinny set personaProfile off    # stop mirroring; default is on
+```
+
+The persona files are read off disk rather than imported — the two packages do
+not depend on each other, and the tests assert they still agree about the file
+names and the framing sentence.
+
 ## Permissions
 
 `/prinny permissions <off|dangerous|all>` relays tool calls to Matrix for

@@ -103,6 +103,13 @@ import {
   runAssistantTexts,
   resolveActionRoom,
 } from '../src/forwarding.ts';
+import {
+  profileChanged,
+  profileTarget,
+  readActivePersona,
+  type ProfileTarget,
+} from '../src/persona-profile.ts';
+import { agentDir } from '../server/bin/agent-dir.mjs';
 import { beginCompaction, compactionInFlight, endCompaction, PRINNY_OWNER } from '../src/compaction-lock.ts';
 import { ChannelLifecycle } from '../src/channel-lifecycle.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
@@ -438,6 +445,11 @@ function startHooks() {
             connected = true;
             lastError = undefined;
             setStatus('prinny: connected');
+            // The channel has only just come up, so a persona adopted in an
+            // earlier session has not been applied to this connection yet.
+            // Fire-and-forget: this runs inside the sidecar's stderr reader, and
+            // awaiting a homeserver round trip there would stall the reader.
+            void syncPersonaProfile();
           }
           notify(line.trim(), verdict.level);
         },
@@ -1396,6 +1408,82 @@ function stopTyping(): void {
 }
 
 /**
+ * The bot's own display name, before any persona touched it.
+ *
+ * Captured once, the first time a persona is applied — not at connect, because
+ * the channel may already be wearing a persona from a previous session and
+ * "before any persona" would then capture the persona. Null means nothing has
+ * been changed yet and there is nothing to restore.
+ */
+let defaultDisplayName: string | null = null;
+/** What was last pushed to the homeserver, so a settled run is usually free. */
+let appliedProfile: ProfileTarget | null = null;
+
+/**
+ * Mirror the bot's Matrix profile to the active persona.
+ *
+ * Read off disk rather than imported: `vendor/pi-persona` owns those files and
+ * vendor packages here do not import each other. See ../src/persona-profile.ts.
+ *
+ * Called on session start and on every settled run, because the persona is
+ * written BY THE MODEL between turns — there is no event to hang this on, and a
+ * stat of two files is cheap enough to do at that rate. Everything below the
+ * change check is skipped in the common case.
+ *
+ * Failure is deliberately quiet in the channel log rather than loud in the TUI:
+ * a profile that did not update is cosmetic, and the alternative is a
+ * notification every settled turn on a homeserver that is refusing uploads.
+ */
+async function syncPersonaProfile(): Promise<void> {
+  if (settings.personaProfile !== 'on') return;
+  if (!child?.running) return;
+
+  let target: ProfileTarget;
+  try {
+    target = profileTarget(readActivePersona(agentDir()), defaultDisplayName);
+  } catch (err) {
+    log(`persona profile: could not read the active persona: ${err}`);
+    return;
+  }
+  if (!profileChanged(target, appliedProfile)) return;
+
+  // First application: remember what to put back when the persona is cleared.
+  // `set_profile` with no arguments is a pure read, so this needs no second tool.
+  if (appliedProfile === null && defaultDisplayName === null && target.displayName) {
+    try {
+      const read = await callSidecar('set_profile', {});
+      const parsed = JSON.parse(read.content[0]?.text ?? '{}') as { displayName?: unknown };
+      defaultDisplayName = typeof parsed.displayName === 'string' ? parsed.displayName : null;
+    } catch (err) {
+      // Not fatal: without it, clearing a persona leaves the last name in place
+      // rather than restoring one. Said in the log so it is findable.
+      log(`persona profile: could not read the bot's own name to restore later: ${err}`);
+      defaultDisplayName = null;
+    }
+  }
+
+  const args: Record<string, unknown> = {};
+  if (target.displayName) args.display_name = target.displayName;
+  if (target.avatarUrl) args.avatar_url = target.avatarUrl;
+  else if (appliedProfile?.avatarUrl) args.clear_avatar = true;
+  if (Object.keys(args).length === 0) {
+    appliedProfile = target;
+    return;
+  }
+
+  try {
+    await callSidecar('set_profile', args);
+    appliedProfile = target;
+    log(
+      `persona profile: ${target.displayName ?? '(unchanged)'}` +
+        (target.avatarUrl ? ` + avatar` : appliedProfile?.avatarUrl ? ' + avatar cleared' : '')
+    );
+  } catch (err) {
+    log(`persona profile: set_profile failed: ${err}`);
+  }
+}
+
+/**
  * Send the run's answer, and continue the run if it produced none.
  *
  * Returns whether a CONTINUATION was started, because `agent_settled` has one
@@ -2078,6 +2166,8 @@ Settings
                                 pi: ${SETTING_KEYS.join(', ')}
   /prinny forward <off|result|last|all>
                                 how much of the answer goes to Matrix by itself
+  /prinny set personaProfile <on|off>
+                                wear the active persona's name and face
   /prinny permissions <off|dangerous|all>
 
 Credentials
@@ -2660,6 +2750,10 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   // hand is the run's actual answer rather than an intermediate one that a
   // retry is about to replace.
   pi.on('agent_settled', async () => {
+    // The persona file is written BY THE MODEL, between turns, so there is no
+    // event to hang this on — a settled run is the cheapest reliable moment.
+    // Everything past the change check is skipped in the common case.
+    void syncPersonaProfile();
     // Cleared before forwarding, so the indicator is down by the time the answer
     // lands rather than a beat after it — a bot still "typing" next to a
     // finished reply reads as though more is coming.

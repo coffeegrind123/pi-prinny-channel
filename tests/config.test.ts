@@ -54,6 +54,12 @@ describe('readSettings', () => {
     expect(assistantTextOfMessage(withThinking)).toBe('404, huh… *tilts head*');
   });
 
+  // The bot wearing the persona's name and face is visible to everyone in every
+  // room it is in, so the default is pinned rather than assumed.
+  it('wears the active persona by default', () => {
+    expect(DEFAULT_SETTINGS.personaProfile).toBe('on');
+  });
+
   it('leaves the permission relay off by default', () => {
     expect(DEFAULT_SETTINGS.permissionMode).toBe('off');
   });

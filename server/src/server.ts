@@ -60,6 +60,7 @@ import type {
   Bot,
   Context,
   InlineKeyboard,
+  MatrixClient,
   MatrixEvent,
   MessageOptions,
   Room,
@@ -183,6 +184,42 @@ process.on('uncaughtException', (err) => log(`uncaught exception: ${err}`));
  * sentence explaining the state instead of an internal error.
  */
 let bot: Bot | null = null;
+
+/** Bytes an avatar may be before this refuses it. Homeservers cap uploads and a
+ *  card image is a portrait, not a video. */
+const MAX_AVATAR_BYTES = 8 * 1024 * 1024;
+const AVATAR_FETCH_TIMEOUT_MS = 20_000;
+
+/**
+ * Fetch an http(s) image and upload it to the homeserver, returning its mxc://.
+ *
+ * Matrix will not take an external URL as an avatar, so the card's image has to
+ * be re-hosted once. Everything here is bounded and everything it rejects, it
+ * rejects with a reason: a homeserver that 413s a 40 MB upload reports it as a
+ * failed sync, which is not a sentence anyone can act on.
+ */
+async function uploadAvatar(client: MatrixClient, url: string): Promise<string> {
+  if (!/^https?:\/\//i.test(url)) throw new Error(`not an http(s) URL: ${url}`);
+  const res = await fetch(url, { signal: AbortSignal.timeout(AVATAR_FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`fetch failed: ${res.status} ${res.statusText}`);
+  const type = res.headers.get('content-type') ?? 'image/png';
+  if (!type.startsWith('image/')) throw new Error(`not an image: ${type}`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length > MAX_AVATAR_BYTES) {
+    throw new Error(`image is ${buffer.length} bytes, over the ${MAX_AVATAR_BYTES} cap`);
+  }
+  // `uploadContent` returns `{ content_uri }` on this SDK version. Read
+  // defensively rather than cast: an older build returns the bare string, and a
+  // wrong assumption here produces an avatar set to "[object Object]".
+  const uploaded = (await client.uploadContent(buffer, { type })) as
+    | { content_uri?: string }
+    | string;
+  const uri = typeof uploaded === 'string' ? uploaded : uploaded?.content_uri;
+  if (!uri || !uri.startsWith('mxc://')) {
+    throw new Error(`the homeserver returned no usable content_uri (${JSON.stringify(uploaded).slice(0, 120)})`);
+  }
+  return uri;
+}
 
 function requireBot(): Bot {
   if (!bot) {
@@ -568,6 +605,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      // Not registered with pi either, for the same reason as `typing`: the
+      // extension drives it from the persona files, which the model has no
+      // business editing. It costs the model nothing.
+      name: 'set_profile',
+      description:
+        "Set the bot's Matrix display name and avatar. Internal — driven by the harness, not the model.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          display_name: { type: 'string' },
+          avatar_url: { type: 'string', description: 'http(s) image URL; uploaded and set as the avatar' },
+          clear_avatar: { type: 'boolean' },
+        },
+      },
+    },
+    {
       name: 'react',
       description:
         'Add an emoji reaction to a message. Matrix accepts any emoji — there is no whitelist.',
@@ -724,6 +777,60 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         await api.sendTyping(roomId, active, timeoutMs);
         return { content: [{ type: 'text', text: active ? 'typing' : 'stopped' }] };
+      }
+
+      case 'set_profile': {
+        // No room, so no assertTargetRoom: a profile is account-wide.
+        const client = requireBot().matrixClient;
+        const done: string[] = [];
+
+        const displayName = typeof args.display_name === 'string' ? args.display_name.trim() : '';
+        if (displayName) {
+          await client.setDisplayName(displayName);
+          done.push(`name=${displayName}`);
+        }
+
+        if (args.clear_avatar === true) {
+          await client.setAvatarUrl('');
+          done.push('avatar cleared');
+        } else if (typeof args.avatar_url === 'string' && args.avatar_url) {
+          // The card's image is an ordinary http(s) URL and Matrix only accepts
+          // mxc://, so it has to be fetched and re-uploaded once. Bounded, and
+          // failing here must not cost the display name that already applied —
+          // hence the separate try.
+          try {
+            const uploaded = await uploadAvatar(client, args.avatar_url);
+            await client.setAvatarUrl(uploaded);
+            done.push(`avatar=${uploaded}`);
+          } catch (err) {
+            log(`avatar upload failed (${args.avatar_url}): ${err}`);
+            done.push(`avatar failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        // Always report the profile as it now stands, as JSON. With no
+        // arguments this is a pure read, which is how the extension learns the
+        // name to put back when a persona is cleared — without it needing a
+        // second tool, and without parsing a human sentence.
+        const userId = client.getUserId();
+        let current: { displayName: string | null; avatarUrl: string | null } = {
+          displayName: null,
+          avatarUrl: null,
+        };
+        try {
+          const profile = userId ? await client.getProfileInfo(userId) : null;
+          current = {
+            displayName: profile?.displayname ?? null,
+            avatarUrl: profile?.avatar_url ?? null,
+          };
+        } catch (err) {
+          log(`could not read back the profile: ${err}`);
+        }
+        return {
+          content: [
+            { type: 'text', text: JSON.stringify({ ...current, changed: done }) },
+          ],
+        };
       }
 
       case 'react': {
