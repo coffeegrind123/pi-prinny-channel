@@ -21,6 +21,16 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # BEFORE the unit tests, not after. tests/tool-budget.test.ts measures what
+      # the extension actually puts on the wire by running a real pi turn against
+      # a stub sidecar, and it THROWS rather than skips when pi is absent — that
+      # is deliberate, because the number it guards is a token budget and a
+      # silently-skipped budget test is worse than no budget test. Ordering the
+      # install after the suite made the job fail with `# fail 0` in its own
+      # output, which reads as a broken package rather than a broken workflow.
+      - name: Install pi
+        run: npm install -g @earendil-works/pi-coding-agent
+
       # The sidecar's Matrix dependencies are installed and compiled outside the
       # repo, which is what --prepare does. The suite runs against that compiled
       # output rather than a re-compile of it, so this is not optional setup —
@@ -28,15 +38,17 @@ jobs:
       - name: Build the sidecar runtime
         run: npm run prepare-runtime
 
+      # Two assertions on one run, because "no failures" and "everything ran" are
+      # different facts and only the pair is worth anything. Five suites read a
+      # SIBLING vendor package's source; standalone they skip, and the count
+      # below is what that costs. If it grows, something else started skipping.
       - name: Unit tests
-        run: npm run test:unit
-
-      # Separate, and after pi is installed, so "pi would not install" is not
-      # reported as "the extension is broken". This is the step that catches a
-      # wrong notification method name — the extension's whole job, and something
-      # no unit test can see.
-      - name: Install pi
-        run: npm install -g @earendil-works/pi-coding-agent
+        run: |
+          npm run test:unit 2>&1 | tee /tmp/unit.txt
+          grep -q "^# fail 0" /tmp/unit.txt
+          skipped=$(sed -n 's/^# skipped //p' /tmp/unit.txt | head -1)
+          test "${skipped:-0}" -le 2 \
+            || { echo "more suites skipped than the 2 cross-source ones: $skipped"; exit 1; }
 
       - name: The extension inside a real pi
         run: npm run test:e2e

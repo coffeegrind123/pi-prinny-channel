@@ -1,0 +1,12 @@
+# Nothing here is built into the repo — the extension is TypeScript run through
+# pi's loader, and the sidecar runtime is compiled OUTSIDE the tree, into
+# ~/.pi/agent/channels/prinny/runtime. So this exists to catch what a
+# contributor's tooling leaves behind, not to hide an output directory.
+node_modules/
+*.log
+.DS_Store
+npm-debug.log*
+.env
+.env.local
+coverage/
+*.tsbuildinfo
