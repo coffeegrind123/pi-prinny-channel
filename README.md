@@ -93,7 +93,7 @@ it does not otherwise have would be a surprise rather than a feature.
 
 ```bash
 npm run lint
-npm run test:unit      # 603, no network, no Matrix
+npm run test:unit      # no network, no Matrix
 npm run prepare-runtime && npm test   # adds the e2e suite
 ```
 
