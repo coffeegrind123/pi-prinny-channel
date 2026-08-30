@@ -83,6 +83,13 @@ The persona files are read off disk rather than imported — the two packages do
 not depend on each other, and the tests assert they still agree about the file
 names and the framing sentence.
 
+## Wearing the persona's profile
+
+With a persona active the bot takes its name and the card's image, advertises a
+short description, and fills in the **About Me** on its profile card — the last
+in first person, because that box is what every account fills in about itself.
+Written once by pi-persona's extraction turn, published in one sync.
+
 ## The status bubble
 
 The bot's Matrix status message follows what the session is doing — `thinking…`,

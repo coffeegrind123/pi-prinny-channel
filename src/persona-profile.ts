@@ -32,10 +32,10 @@ export interface PersonaIdentity {
   name: string;
   /** Card image, when the library has one for this persona. */
   avatarUrl: string | null;
-  /** One standalone sentence introducing the character, or null. */
+  /** One standalone sentence introducing the character, third person, or null. */
   shortDescription: string | null;
-  /** Two or three sentences on who they are, or null. */
-  description: string | null;
+  /** The character introducing THEMSELVES, first person, or null. */
+  aboutMe: string | null;
 }
 
 /**
@@ -46,7 +46,18 @@ export interface PersonaIdentity {
  * `pi-persona`'s copy all agree.
  */
 export const SHORT_DESCRIPTION_MAX = 120;
-export const DESCRIPTION_MAX = 512;
+/** cinny's biography TextArea is `maxLength={1024}`. MSC4440 states no limit. */
+export const ABOUT_ME_MAX = 1024;
+
+/**
+ * The extended profile key every prinny client renders as "About Me" on a
+ * profile card, with the fallback the client also reads.
+ *
+ * The value is not a bare string: `{ 'm.text': [{ body }] }`, read back by
+ * `getProfileBiography`, which takes the first representation whose mimetype is
+ * not text/html.
+ */
+export const BIOGRAPHY_KEY = 'gay.fomx.biography';
 
 /**
  * The two labelled lines `pi-persona`'s extraction turn writes.
@@ -55,13 +66,16 @@ export const DESCRIPTION_MAX = 512;
  * a persona extracted before they existed, or written by hand, advertises no
  * description, and that is not an error.
  *
- * `Description:` is a SUFFIX of `Short description:`, so the match is anchored
- * to the start of a line — a loose one reads the short line as the long one and
- * the two come out identical for every persona, which looks like it works.
+ * Line-anchored: the labels are prose in a file the model wrote, and a loose
+ * match would let one label satisfy a search for a suffix of another.
+ *
+ * The two are in different VOICES, which is the thing to keep straight:
+ * `Short description` is third person (a bot advertisement) and `About me` is
+ * first person (the profile-card biography every account fills in about itself).
  */
 export function parsePersonaDescription(md: string): {
   short: string | null;
-  long: string | null;
+  aboutMe: string | null;
 } {
   const one = (label: string, max: number): string | null => {
     const m = md.match(new RegExp(`^${label}:[ \\t]*(.+)$`, 'im'));
@@ -71,7 +85,7 @@ export function parsePersonaDescription(md: string): {
   };
   return {
     short: one('Short description', SHORT_DESCRIPTION_MAX),
-    long: one('Description', DESCRIPTION_MAX),
+    aboutMe: one('About me', ABOUT_ME_MAX),
   };
 }
 
@@ -163,7 +177,7 @@ export function readActivePersona(agentDir: string): PersonaIdentity | null {
     name,
     avatarUrl: findAvatarUrl(agentDir, name),
     shortDescription: described.short,
-    description: described.long,
+    aboutMe: described.aboutMe,
   };
 }
 

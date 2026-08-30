@@ -221,6 +221,16 @@ async function uploadAvatar(client: MatrixClient, url: string): Promise<string> 
   return uri;
 }
 
+/**
+ * The extended profile key clients render as "About Me".
+ *
+ * A second copy of `src/persona-profile.ts`'s `BIOGRAPHY_KEY`. The sidecar is
+ * compiled into a runtime OUTSIDE this repo and cannot import that file — the
+ * same constraint `src/config.ts` documents for `stateDir` — so the constant is
+ * written twice and `tests/persona-profile.test.ts` asserts the two agree.
+ */
+const BIOGRAPHY_KEY = 'gay.fomx.biography';
+
 function requireBot(): Bot {
   if (!bot) {
     throw new Error(
@@ -665,6 +675,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      // Internal. The "About Me" box on a profile card — an MSC4133 extended
+      // profile property, which is a different API from both the account profile
+      // (set_profile) and the advertised bot info (set_bot_profile).
+      name: 'set_biography',
+      description:
+        "Set the bot's About Me (extended profile biography). Internal — driven by the harness.",
+      inputSchema: {
+        type: 'object',
+        properties: { text: { type: 'string', description: 'Empty clears it.' } },
+        required: ['text'],
+      },
+    },
+    {
       name: 'react',
       description:
         'Add an emoji reaction to a message. Matrix accepts any emoji — there is no whitelist.',
@@ -951,6 +974,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // power to set state falls back to a timeline event on its own.
         await requireBot().setMyProfile(profile);
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, published: Object.keys(profile) }) }] };
+      }
+
+      case 'set_biography': {
+        const client = requireBot().matrixClient;
+        const text = typeof args.text === 'string' ? args.text.trim() : '';
+        // The value is a structured representation, not a string:
+        // `{ 'm.text': [{ body }] }`, which is what getProfileBiography reads.
+        // A bare string is accepted by the server and rendered by nothing.
+        try {
+          if (text) {
+            await client.setExtendedProfileProperty(BIOGRAPHY_KEY, { 'm.text': [{ body: text }] });
+          } else {
+            await client.deleteExtendedProfileProperty(BIOGRAPHY_KEY);
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] };
+        } catch (err) {
+          // Extended profiles are MSC4133; a homeserver without them answers
+          // M_UNRECOGNIZED. That is a deployment fact, not a bug here, and it
+          // must not read as one.
+          const code = (err as { errcode?: string }).errcode;
+          if (code === 'M_UNRECOGNIZED') {
+            throw new Error(
+              'this homeserver does not support extended profiles (MSC4133), so there is no ' +
+                'About Me to set. Nothing else is affected.'
+            );
+          }
+          throw err;
+        }
       }
 
       case 'react': {

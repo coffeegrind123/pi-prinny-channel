@@ -7,13 +7,14 @@
  * packages is asserted here rather than enforced by a type.
  */
 
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it, siblingPath, skipWithoutSibling } from './harness.ts';
 import {
-  DESCRIPTION_MAX,
+  ABOUT_ME_MAX,
+  BIOGRAPHY_KEY,
   findAvatarUrl,
   parsePersonaDescription,
   parsePersonaName,
@@ -49,7 +50,7 @@ describe('reading the active persona', () => {
       name: 'Crystal',
       avatarUrl: 'https://avatars.example/crystal.png',
       shortDescription: null,
-      description: null,
+      aboutMe: null,
     });
     rmSync(root, { recursive: true, force: true });
   });
@@ -58,14 +59,12 @@ describe('reading the active persona', () => {
     const root = agentDir();
     writeFileSync(
       join(root, 'PERSONA.md'),
-      `${FRAMING('Crystal')}\n\nShort description: A shy fox-girl who calls you master.\nDescription: Crystal stammers when flustered and brightens when given a task.`,
+      `${FRAMING('Crystal')}\n\nShort description: A shy fox-girl who calls you master.\nAbout me: H-hi! I'm Crystal, and I look after my master.`,
       'utf8'
     );
     const persona = readActivePersona(root)!;
     expect(persona.shortDescription).toBe('A shy fox-girl who calls you master.');
-    expect(persona.description).toBe(
-      'Crystal stammers when flustered and brightens when given a task.'
-    );
+    expect(persona.aboutMe).toBe("H-hi! I'm Crystal, and I look after my master.");
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -77,17 +76,19 @@ describe('reading the active persona', () => {
     const persona = readActivePersona(root)!;
     expect(persona.name).toBe('Crystal');
     expect(persona.shortDescription).toBe(null);
-    expect(persona.description).toBe(null);
+    expect(persona.aboutMe).toBe(null);
     rmSync(root, { recursive: true, force: true });
   });
 
   // "Description:" is a suffix of "Short description:". A loose match reads the
   // short line as the long one and the two come out identical for every
   // persona — which looks like it works.
-  it('does not read the short line as the long one', () => {
-    const d = parsePersonaDescription('Short description: the short one.\nDescription: the long one.');
-    expect(d.short).toBe('the short one.');
-    expect(d.long).toBe('the long one.');
+  it('keeps the two labels, and their two voices, apart', () => {
+    const d = parsePersonaDescription(
+      'Short description: the third-person one.\nAbout me: the first-person one.'
+    );
+    expect(d.short).toBe('the third-person one.');
+    expect(d.aboutMe).toBe('the first-person one.');
   });
 
   it('is null when no persona is active', () => {
@@ -105,7 +106,7 @@ describe('reading the active persona', () => {
       name: 'Ada Lovelace',
       avatarUrl: null,
       shortDescription: null,
-      description: null,
+      aboutMe: null,
     });
     rmSync(root, { recursive: true, force: true });
   });
@@ -227,11 +228,11 @@ describe('the two packages agree about the persona files', {
     // The budgets are @prinny/bot's Limits, duplicated in both packages because
     // neither may import the other. Three copies, asserted equal here.
     expect(SHORT_DESCRIPTION_MAX).toBe(storage.SHORT_DESCRIPTION_MAX);
-    expect(DESCRIPTION_MAX).toBe(storage.DESCRIPTION_MAX);
-    const md = 'Short description: short.\nDescription: long.';
+    expect(ABOUT_ME_MAX).toBe(storage.ABOUT_ME_MAX);
+    const md = 'Short description: short.\nAbout me: first person.';
     expect(parsePersonaDescription(md)).toEqual(storage.parsePersonaDescription(md));
-    const over = `Description: ${'x'.repeat(900)}`;
-    expect(parsePersonaDescription(over).long).toBe(storage.parsePersonaDescription(over).long);
+    const over = `About me: ${'x'.repeat(2000)}`;
+    expect(parsePersonaDescription(over).aboutMe).toBe(storage.parsePersonaDescription(over).aboutMe);
   });
 
   it('that the extraction prompt still asks for a description at all', async () => {
@@ -241,7 +242,24 @@ describe('the two packages agree about the persona files', {
       siblingPath('pi-persona', 'src/processor.ts') as string
     );
     expect(EXTRACTION_PROMPT.includes('Short description:')).toBe(true);
+    expect(EXTRACTION_PROMPT.includes('About me:')).toBe(true);
     expect(EXTRACTION_PROMPT.includes(`<= ${SHORT_DESCRIPTION_MAX} characters`)).toBe(true);
+    expect(EXTRACTION_PROMPT.includes(`<= ${ABOUT_ME_MAX} characters`)).toBe(true);
+    // The voice is the point of About me, and the easy thing to get backwards.
+    expect(EXTRACTION_PROMPT.includes('FIRST PERSON')).toBe(true);
+  });
+
+  // The sidecar is compiled outside this repo and cannot import src/, so the
+  // biography key is written twice. Two copies, asserted equal.
+  it('the sidecar spells the biography key the same way', () => {
+    const src = readFileSync(
+      new URL('../server/src/server.ts', import.meta.url),
+      'utf8'
+    );
+    const declared = /const BIOGRAPHY_KEY = '([^']+)'/.exec(src)?.[1];
+    expect(declared).toBe(BIOGRAPHY_KEY);
+    // And it is the key the client actually reads, not an invention.
+    expect(BIOGRAPHY_KEY).toBe('gay.fomx.biography');
   });
 
   it('that meta.json still carries avatarUrl', async () => {

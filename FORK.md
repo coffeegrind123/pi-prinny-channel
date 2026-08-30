@@ -2524,11 +2524,17 @@ spend a rate-limited write to do it.
 Three things were considered and rejected on evidence rather than taste.
 
 **Rich presence (MSC4320)** — an activity with a name, image and details, the
-Discord-shaped thing, and by far the nicest of the options. It is written as an
-**MSC4133 extended profile field**, and the homeserver advertises neither: it
-reports Matrix **v1.12** and its `unstable_features` has no MSC4133 entry.
-Unreachable until the server moves. The same gate blocks `m.pronouns`,
-`m.banner_url`, `m.biography`, and `m.tz` (a defined key since Matrix 1.16).
+Discord-shaped thing. Written up here as unreachable, on the grounds that it
+rides on MSC4133 extended profiles and the homeserver advertised neither.
+
+**That was wrong — see AQ6.** The `unstable_features` list has no MSC4133 entry,
+but `PUT /_matrix/client/v3/profile/{user}/{key}` works: extended profiles are
+live on this homeserver, and the flag was never the thing to read. Rich presence
+is therefore *available* and simply not built; it is still the nicest unbuilt
+option here.
+
+The finding this section got right is narrower: those fields are not writable
+through the **unstable** `uk.tcpip.msc4133` path, which 404s.
 
 **`setMyProfile`'s `description` / `short_description`** — available today,
 needs no homeserver feature, and nearly pointless: reading the client, the only
@@ -2660,3 +2666,55 @@ and the advertising failing never costs the display name and avatar, which are
 the parts people can actually see.
 
 652 tests, up from 638.
+
+
+## AQ6 — the About Me, and a capability I twice declared missing
+
+The persona now writes its own **About Me** — the box on a profile card that
+every prinny client renders — and it is the one piece of persona text in **first
+person**, because that box is what every account on the homeserver fills in about
+itself. A third-person one reads as a bot pretending to be a person and failing.
+
+```
+Short description: A shy fox-girl assistant who calls you master.      third person, 120
+About me: H-hi! I'm Crystal, and I look after my master. …             FIRST person, 1024
+```
+
+`gay.fomx.biography` (MSC4440), value `{ 'm.text': [{ body }] }` — not a bare
+string, which the server accepts and nothing renders. 1024 is cinny's own
+`TextArea maxLength`, not a protocol limit; MSC4440 states none.
+
+### The correction
+
+AQ4 and AQ5 both said extended profiles were unavailable here, and both cited the
+same evidence: the homeserver reports Matrix v1.12 and its `unstable_features`
+carries no MSC4133 entry. On that basis rich presence was called unreachable and
+`m.biography` was written off with it.
+
+**The flag was the wrong thing to read.** Probing the endpoint instead:
+
+```
+PUT _matrix/client/unstable/uk.tcpip.msc4133/profile/{u}/{k}   404  M_UNRECOGNIZED
+PUT _matrix/client/v3/profile/{u}/{k}   (bare value)           400  M_MISSING_PARAM
+PUT _matrix/client/v3/profile/{u}/{k}   {"<key>": <value>}     200  round-trips
+```
+
+The 400 is the interesting line: `Missing key 'gay.fomx.biography'` is a routed
+request complaining about a body, which is a working endpoint saying so. The
+first probe had simply sent the wrong shape — the spec wraps the key in the body
+— and a 4xx was read as "not supported".
+
+This is the repo's own rule, missed twice in a row: **probe the route, do not
+trust the advertisement.** A capability list is a claim about a server; a request
+is a measurement of one. The cost was two features written off, one of which
+(rich presence) is still worth building.
+
+### Three copies of one key
+
+The sidecar is compiled into a runtime outside this repo and cannot import
+`src/`, so `BIOGRAPHY_KEY` is declared in both, and the test asserts they agree
+and that the value is the key the client actually reads rather than an invention.
+A homeserver without MSC4133 answers `M_UNRECOGNIZED`, and that is reported as a
+deployment fact rather than a bug.
+
+658 tests, up from 657.

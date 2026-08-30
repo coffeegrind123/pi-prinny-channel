@@ -1,6 +1,6 @@
 {
   "name": "pi-prinny-channel",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Matrix channel for pi \u2014 talk to a pi session, and the local model behind it, from any Matrix client",
   "keywords": [
     "pi-package",

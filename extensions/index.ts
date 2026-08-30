@@ -1495,13 +1495,22 @@ async function syncPersonaProfile(): Promise<void> {
     try {
       await callSidecar('set_bot_profile', {
         name: persona.name,
-        ...(persona.description ? { description: persona.description } : {}),
         ...(persona.shortDescription ? { short_description: persona.shortDescription } : {}),
       });
     } catch (err) {
       // Advertising is cosmetic; the display name and avatar below are not, and
       // must not be lost to a failure here.
       log(`persona profile: could not advertise bot info: ${err}`);
+    }
+    // The "About Me" box on the profile card — the one thing here a person
+    // actually clicks through to read, and the only persona text written in
+    // FIRST person, because it is the box every account fills in about itself.
+    if (persona.aboutMe) {
+      try {
+        await callSidecar('set_biography', { text: persona.aboutMe });
+      } catch (err) {
+        log(`persona profile: could not set About Me: ${err}`);
+      }
     }
   }
 
