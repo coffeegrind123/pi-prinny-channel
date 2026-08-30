@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, loadServerModule, vi } from './harness.ts';
 import { DEFAULT_SETTINGS, parseSetting, readSettings, stateDir, writeSettings } from '../src/config.ts';
+import { assistantTextOfMessage } from '../src/forwarding.ts';
 
 let dir: string;
 let file: string;
@@ -27,8 +28,30 @@ describe('readSettings', () => {
     expect(readSettings(file)).toEqual(DEFAULT_SETTINGS);
   });
 
-  it('forwards the turn result by default, because a small model does not call the tool', () => {
-    expect(DEFAULT_SETTINGS.forward).toBe('result');
+  // Both defaults changed 2026-08-30 (AQ2). Pinned rather than merely asserted:
+  // they are the two settings that decide whether the person on Matrix is a
+  // participant or an audience, and a silent revert would present as "the bot
+  // went quiet again" weeks later.
+  it('streams every assistant message by default, so a long task is not silence', () => {
+    expect(DEFAULT_SETTINGS.forward).toBe('all');
+  });
+
+  it('delivers an inbound message as a steer by default, so a correction lands mid-run', () => {
+    expect(DEFAULT_SETTINGS.deliverAs).toBe('steer');
+  });
+
+  // Whatever the mode, thinking is not forwardable — the filter is an allowlist
+  // on type === "text" and lives in forwarding.ts. This is here because the
+  // default moving to `all` is exactly when somebody would assume otherwise.
+  it('forwards no thinking in any mode', () => {
+    const withThinking = {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'the board list does not include lmg, hmm' },
+        { type: 'text', text: '404, huh… *tilts head*' },
+      ],
+    };
+    expect(assistantTextOfMessage(withThinking)).toBe('404, huh… *tilts head*');
   });
 
   it('leaves the permission relay off by default', () => {

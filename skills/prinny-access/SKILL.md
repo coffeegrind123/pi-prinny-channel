@@ -80,17 +80,31 @@ Matrix client, and it accepts while the policy is `pairing`.
 How much of the answer goes to Matrix by itself:
 
 ```
-/prinny forward result   # everything said in the turn, in order, as one message (default)
+/prinny forward all      # every assistant message as it completes (default)
+/prinny forward result   # everything said in the turn, in order, as ONE message
+                         # when the turn settles — one notification, and a retry
+                         # cannot leave a superseded answer standing
 /prinny forward last     # only the turn's closing text — loses the answer when
                          # the turn does not end on it (a mid-turn tool call is enough)
-/prinny forward all      # every assistant message as it completes
 /prinny forward off      # nothing unless the model calls prinny_reply
 ```
 
-Only assistant **text** is ever forwarded — thinking and tool calls never are.
-`result` is the default because a small local model writes its answer in the
-transcript instead of calling the reply tool, and with `off` that answer reaches
-nobody.
+Only assistant **text** is ever forwarded — thinking and tool calls never are, in
+any mode. The filter is an allowlist on `type === "text"`, so a content kind a
+future pi adds is excluded by default rather than leaked.
+
+Forwarding is on by default at all because a small local model writes its answer
+in the transcript instead of calling the reply tool, and with `off` that answer
+reaches nobody. `all` is the default among the on-modes so the sender follows a
+long task instead of watching silence.
+
+How an inbound message is delivered while the model is mid-run:
+
+```
+/prinny set deliverAs steer      # lands after the current tool calls, before the
+                                 # next model call — a correction redirects (default)
+/prinny set deliverAs followUp   # waits for the agent to finish every tool call
+```
 
 Presentation, passed through to the channel:
 

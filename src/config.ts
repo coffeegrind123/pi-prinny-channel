@@ -102,8 +102,14 @@ export type PermissionMode = 'off' | 'dangerous' | 'all';
  * content kind added by a future pi is excluded by default rather than leaked.
  *
  * - `off`     nothing is sent unless the model calls `prinny` with action `reply`.
+ * - `all`     every assistant text message as it completes (the default), so the
+ *             sender follows a long task instead of watching silence for two
+ *             minutes. See FORK.md AQ2 for why this is the default and what it
+ *             costs.
  * - `result`  everything the model said in that turn, in order, as one message
- *             when the turn settles (the default).
+ *             when the turn settles. One Matrix message and one notification per
+ *             turn, and it waits for `agent_settled`, so a retry cannot leave a
+ *             superseded intermediate answer standing on somebody's phone.
  * - `last`    only the closing text of the turn. This was `result`'s behaviour
  *             until 2026-08-30, and it loses the answer whenever a turn does not
  *             end on it — a tool call mid-turn is enough, because pi starts a new
@@ -111,12 +117,10 @@ export type PermissionMode = 'off' | 'dangerous' | 'all';
  *             thing that can reach a stranger, and a session that wants that
  *             should be able to have it. See `runAssistantText` in forwarding.ts
  *             for the measured incident.
- * - `all`     every assistant text message in the turn, as it completes, so the
- *             sender sees progress on a long task instead of silence.
  *
- * `result` and `all` now carry the same text; they differ in WHEN and in HOW
- * MANY Matrix messages it becomes — `all` streams one per assistant message
- * during the run, `result` sends one message after it settles.
+ * `result` and `all` carry the same text; they differ in WHEN and in HOW MANY
+ * Matrix messages it becomes — `all` streams one per assistant message during
+ * the run, `result` sends one message after it settles.
  */
 export type ForwardMode = 'off' | 'result' | 'last' | 'all';
 
@@ -148,8 +152,21 @@ export type PiSettings = {
 };
 
 export const DEFAULT_SETTINGS: PiSettings = {
-  deliverAs: 'followUp',
-  forward: 'result',
+  // `steer`, not `followUp`, changed 2026-08-30. `followUp` holds an inbound
+  // Matrix message until the agent has finished EVERY tool call, so a
+  // correction typed halfway through a ten-call browse lands after the browse
+  // is over — by which point it is a comment on history rather than a
+  // redirection. The sender is a participant in the conversation, not an
+  // audience for it, and the whole reason this channel exists is that they are
+  // not sitting at the terminal. Cost: a steer interrupts the loop, and a 27B
+  // model that is steered mid-task sometimes drops the original goal. That is a
+  // worse failure than a late message on paper and a better one in practice,
+  // because it is VISIBLE — the sender sees the model change direction, and can
+  // say so.
+  deliverAs: 'steer',
+  // `all`, not `result`, changed 2026-08-30. See ForwardMode above for what the
+  // modes are and FORK.md AQ2 for why the default moved.
+  forward: 'all',
   permissionMode: 'off',
   permissionTools: [],
   permissionTimeoutSeconds: 300,

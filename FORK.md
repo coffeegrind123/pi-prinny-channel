@@ -2327,3 +2327,65 @@ registry filter that stops the duplicate.
 One existing test changed rather than broke: `config.test.ts` pins the enum the
 error message advertises, which is now `off | result | last | all`. That is the
 test doing its job.
+
+## AQ2 — the defaults, decided rather than inherited
+
+`forward` was `result` and `deliverAs` was `followUp`. Neither had an argument
+behind it. The only rationale in the tree was in `skills/prinny-access/SKILL.md`
+— "`result` is the default because a small local model writes its answer in the
+transcript instead of calling the reply tool, and with `off` that answer reaches
+nobody" — which argues `result` against **`off`**, not against `all`. `followUp`
+had nothing at all.
+
+Asked directly why `all` was not the default, the honest answer was that nobody
+had decided it wasn't. Both now are:
+
+```
+  forward:   'all'      was 'result'
+  deliverAs: 'steer'    was 'followUp'
+```
+
+### Why, and what each one costs
+
+**`forward: 'all'`.** `result` sends one message when the run settles. On a long
+agentic run — the case that prompted this was a ten-tool-call browse hunting for
+a 4chan board — that is several minutes of silence and then a wall of text. The
+sender cannot tell working from wedged, and by the time they can read anything
+the run is over. `all` sends each assistant text message at `message_end`, so
+"404, huh… *tilts head*" arrives while it is still true.
+
+What it costs is N Matrix messages and N notifications per turn instead of one,
+and one real technical edge: `result` fires at `agent_settled`, which was chosen
+deliberately — *"settled is the point at which no retry, compaction or queued
+continuation is still to come, so the text in hand is the run's actual answer
+rather than an intermediate one that a retry is about to replace."* `all` fires
+at `message_end`, so a turn that is later retried or compacted can leave a
+superseded intermediate answer standing on somebody's phone. On this stack, where
+auto-compaction and continuations both fire, that is not hypothetical. It is the
+reason `result` is kept and documented rather than removed.
+
+**`deliverAs: 'steer'`.** `followUp` holds an inbound message until the agent has
+finished **every** tool call. A correction typed halfway through that browse
+would have landed after it, as a comment on history rather than a redirection.
+The person on Matrix is a participant in the conversation, not an audience for
+it — that is the entire reason the channel exists, since they are by definition
+not at the terminal.
+
+What it costs: a steer interrupts the loop, and a 27B model steered mid-task
+sometimes drops the original goal. On paper that is the worse failure. In
+practice it is the better one, because it is **visible** — the sender watches the
+model change direction and can say so — whereas a message that arrives four
+minutes late is indistinguishable from one that was ignored.
+
+### What did not change, and is worth stating because this is when it would be assumed
+
+**Thinking is still not forwardable, in any mode.** `assistantTextOfMessage` is an
+allowlist on `type === "text"`; `thinking` and `toolCall` are excluded by
+construction rather than by an exclusion list, so a content kind pi ships next
+year is excluded by default. `all` streams more messages, not more *kinds* of
+message. The measured session behind AQ1 has 1,238- and 1,410-character thinking
+blocks in it; none of them can reach Matrix under any setting here.
+
+`tests/config.test.ts` pins both new defaults and adds a thinking-exclusion
+assertion beside them, because the default moving to `all` is exactly the moment
+somebody would assume otherwise. 603 tests, up from 601.
