@@ -621,6 +621,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      // Internal, like `typing` and `set_profile`: the harness knows what the
+      // session is doing and the model does not need a schema for it.
+      name: 'set_presence',
+      description:
+        "Set the bot's Matrix presence and status message (the status bubble). Internal — driven by the harness.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          presence: { type: 'string', enum: ['online', 'unavailable', 'offline'] },
+          status_msg: { type: 'string', description: 'Empty string clears it.' },
+        },
+        required: ['presence'],
+      },
+    },
+    {
       name: 'react',
       description:
         'Add an emoji reaction to a message. Matrix accepts any emoji — there is no whitelist.',
@@ -831,6 +846,47 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             { type: 'text', text: JSON.stringify({ ...current, changed: done }) },
           ],
         };
+      }
+
+      case 'set_presence': {
+        const client = requireBot().matrixClient;
+        const presence = typeof args.presence === 'string' ? args.presence : 'online';
+        const statusMsg = typeof args.status_msg === 'string' ? args.status_msg : '';
+        try {
+          // `setPresence` REPLACES the whole presence state rather than merging,
+          // so the presence value goes with every status write — posting only a
+          // status message would quietly reset an `unavailable` back to
+          // `online`. Same reason cinny's /status command sends both.
+          await client.setPresence({ presence, status_msg: statusMsg } as Parameters<
+            typeof client.setPresence
+          >[0]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] };
+        } catch (err) {
+          // Presence is rate-limited — measured 429 on a second write ~3s after
+          // the first, on the homeserver this was built against. The retry is
+          // the CALLER's to schedule, with whatever the status is by then, so
+          // this reports the wait rather than sleeping on it: the sidecar is
+          // single-threaded and a sleep here stalls every other tool.
+          const status = (err as { httpStatus?: number }).httpStatus;
+          const retryAfterMs =
+            (err as { data?: { retry_after_ms?: number } }).data?.retry_after_ms ??
+            (err as { retryAfterMs?: number }).retryAfterMs;
+          if (status === 429) {
+            return {
+              content: [
+                { type: 'text', text: JSON.stringify({ ok: false, rateLimited: true, retryAfterMs }) },
+              ],
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }),
+              },
+            ],
+          };
+        }
       }
 
       case 'react': {

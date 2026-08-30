@@ -60,6 +60,10 @@ describe('readSettings', () => {
     expect(DEFAULT_SETTINGS.personaProfile).toBe('on');
   });
 
+  it('publishes the status bubble by default', () => {
+    expect(DEFAULT_SETTINGS.presenceStatus).toBe('on');
+  });
+
   it('leaves the permission relay off by default', () => {
     expect(DEFAULT_SETTINGS.permissionMode).toBe('off');
   });

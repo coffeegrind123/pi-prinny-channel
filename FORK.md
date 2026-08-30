@@ -2462,3 +2462,87 @@ run about a program that is not in the tree. `npm run prepare-runtime` and they
 pass. Worth recording as the guard working rather than as a wobble.
 
 620 tests, up from 603.
+
+## AQ4 — the status bubble, and the research behind what was NOT built
+
+`m.presence`'s `status_msg` is the line clients render under a display name.
+Cinny shows it in the member list and the chat list (`PresenceStatus`), so a pi
+session can tell somebody who is not at the terminal what it is doing. That is
+the whole reason this channel exists, and it was the obvious next thing after
+the bot started wearing the persona's name and face (AQ3).
+
+`presenceStatus`, default `on`. Driven entirely from the turn lifecycle —
+`agent_start` → `thinking…`, `tool_execution_start` → a line built from the tool
+and its arguments, `agent_settled` → cleared. **No tool, no schema, no tokens.**
+
+```
+  reading src/prompt.ts        $ npm test        browsing boards.4chan.org
+```
+
+### The rate limit is the design
+
+Probed against the homeserver before a line of it was written, by writing at
+increasing gaps and recording what came back:
+
+| gap since the last write | result |
+| --- | --- |
+| 0s (first) | 200 |
+| 2s | **429**, `retry_after_ms` 7200 |
+| 5s | **429**, `retry_after_ms` 1592 |
+| 8s | 200 |
+| 11s, 14s | 200 |
+
+A write lands once roughly **8 seconds** have passed since the last one that
+landed — the shape of Synapse's `rc_presence` bucket. A status that followed
+every tool call would spend its budget in the first seconds of a turn and be
+throttled for the rest of it.
+
+So `StatusThrottle` coalesces: callers offer freely, at most one write leaves per
+12s (above the observed recovery, with headroom), and it is always the **latest**
+value. Replaying a realistic turn through it — six offered lines over 26s —
+produces three writes:
+
+```
+  t+    0ms  "thinking…"
+  t+13000ms  "browsing boards.4chan.org"
+  t+26000ms  ""
+```
+
+The load-bearing property, and the test named as such: **a refused write is
+retried with whatever the status is by then, not with the value that was
+refused.** A queue that retried the refused value would publish
+"reading foo.ts" seconds after the run had moved on. Its control is "offering the
+value already on the server writes nothing" — a throttle that dropped everything
+would pass the first test for the wrong reason.
+
+An unrecognised tool returns `null` and the previous, more specific line stands.
+A vague "working" replacing "running the tests" is a downgrade, and it would
+spend a rate-limited write to do it.
+
+### What the research said NOT to build
+
+Three things were considered and rejected on evidence rather than taste.
+
+**Rich presence (MSC4320)** — an activity with a name, image and details, the
+Discord-shaped thing, and by far the nicest of the options. It is written as an
+**MSC4133 extended profile field**, and the homeserver advertises neither: it
+reports Matrix **v1.12** and its `unstable_features` has no MSC4133 entry.
+Unreachable until the server moves. The same gate blocks `m.pronouns`,
+`m.banner_url`, `m.biography`, and `m.tz` (a defined key since Matrix 1.16).
+
+**`setMyProfile`'s `description` / `short_description`** — available today,
+needs no homeserver feature, and nearly pointless: reading the client, the only
+consumer of `description` is the **server browser listing**
+(`usePublicServers`), and `short_description` is rendered **nowhere**. `name`
+would duplicate the display name AQ3 already sets. Worth a one-off call for
+completeness; not worth wiring to the persona.
+
+**`setChatMenuButton`** — genuinely rendered (`BotMenuButton`), and worth doing.
+Not in this change because it is a different feature with a different failure
+mode, and bundling it would have made the rate-limit work harder to review.
+
+Confirmed the same way: the commands we already publish via `setMyCommands` are
+what earn the **BOT badge** and the `/`-autocomplete, so that half was already
+working.
+
+638 tests, up from 620.

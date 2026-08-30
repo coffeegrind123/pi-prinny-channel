@@ -83,6 +83,22 @@ The persona files are read off disk rather than imported — the two packages do
 not depend on each other, and the tests assert they still agree about the file
 names and the framing sentence.
 
+## The status bubble
+
+The bot's Matrix status message follows what the session is doing — `thinking…`,
+`reading src/prompt.ts`, `$ npm test`, `browsing example.com` — and clears when
+the run settles. Driven from the turn lifecycle, so it costs no tokens and the
+model is not involved.
+
+```
+/prinny set presenceStatus off    # stop publishing it; default is on
+```
+
+Presence is rate-limited by the homeserver (measured: writes land about once
+every 8 seconds), so updates are coalesced — at most one write per 12s, always
+the latest value, and a refusal is retried with whatever the status is by then
+rather than with the value that was refused.
+
 ## Permissions
 
 `/prinny permissions <off|dangerous|all>` relays tool calls to Matrix for

@@ -127,6 +127,9 @@ export type ForwardMode = 'off' | 'result' | 'last' | 'all';
 /** Whether the bot wears the active persona's name and face. */
 export type PersonaProfileMode = 'on' | 'off';
 
+/** Whether the bot's status bubble follows what the session is doing. */
+export type PresenceStatusMode = 'on' | 'off';
+
 export type PiSettings = {
   deliverAs: DeliverAs;
   forward: ForwardMode;
@@ -143,6 +146,16 @@ export type PiSettings = {
    * the confusing half of that.
    */
   personaProfile: PersonaProfileMode;
+  /**
+   * Publish what the session is doing as the Matrix status message — the line
+   * clients show under a display name.
+   *
+   * Coalesced and rate-limited: presence writes are throttled by the homeserver
+   * (measured 429 on a second write ~3s after the first), so callers offer
+   * freely and at most one write leaves per interval, always the latest value.
+   * See src/presence-status.ts.
+   */
+  presenceStatus: PresenceStatusMode;
   permissionMode: PermissionMode;
   /** Extra tool names always gated, whatever the mode. */
   permissionTools: string[];
@@ -184,6 +197,7 @@ export const DEFAULT_SETTINGS: PiSettings = {
   // modes are and FORK.md AQ2 for why the default moved.
   forward: 'all',
   personaProfile: 'on',
+  presenceStatus: 'on',
   permissionMode: 'off',
   permissionTools: [],
   permissionTimeoutSeconds: 300,
@@ -194,6 +208,7 @@ export const DEFAULT_SETTINGS: PiSettings = {
 const DELIVER_AS: DeliverAs[] = ['followUp', 'steer'];
 const FORWARD_MODES: ForwardMode[] = ['off', 'result', 'last', 'all'];
 const PERSONA_PROFILE_MODES: PersonaProfileMode[] = ['on', 'off'];
+const PRESENCE_STATUS_MODES: PresenceStatusMode[] = ['on', 'off'];
 const PERMISSION_MODES: PermissionMode[] = ['off', 'dangerous', 'all'];
 
 /**
@@ -242,6 +257,7 @@ function coerceSettings(raw: Record<string, unknown>): PiSettings {
     deliverAs: asEnum(raw.deliverAs, DELIVER_AS, DEFAULT_SETTINGS.deliverAs),
     forward: asEnum(raw.forward, FORWARD_MODES, DEFAULT_SETTINGS.forward),
     personaProfile: asEnum(raw.personaProfile, PERSONA_PROFILE_MODES, DEFAULT_SETTINGS.personaProfile),
+    presenceStatus: asEnum(raw.presenceStatus, PRESENCE_STATUS_MODES, DEFAULT_SETTINGS.presenceStatus),
     permissionMode: asEnum(raw.permissionMode, PERMISSION_MODES, DEFAULT_SETTINGS.permissionMode),
     permissionTools: Array.isArray(raw.permissionTools)
       ? raw.permissionTools.filter((name): name is string => typeof name === 'string')
@@ -267,6 +283,7 @@ export const SETTING_KEYS: SettingKey[] = [
   'deliverAs',
   'forward',
   'personaProfile',
+  'presenceStatus',
   'permissionMode',
   'permissionTools',
   'permissionTimeoutSeconds',
@@ -302,6 +319,10 @@ export function parseSetting(
       return PERSONA_PROFILE_MODES.includes(value as PersonaProfileMode)
         ? { ok: true, key, value: value as PersonaProfileMode }
         : bad(PERSONA_PROFILE_MODES.join(' | '));
+    case 'presenceStatus':
+      return PRESENCE_STATUS_MODES.includes(value as PresenceStatusMode)
+        ? { ok: true, key, value: value as PresenceStatusMode }
+        : bad(PRESENCE_STATUS_MODES.join(' | '));
     case 'permissionMode':
       return PERMISSION_MODES.includes(value as PermissionMode)
         ? { ok: true, key, value: value as PermissionMode }

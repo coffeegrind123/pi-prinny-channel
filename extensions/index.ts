@@ -110,6 +110,13 @@ import {
   type ProfileTarget,
 } from '../src/persona-profile.ts';
 import { agentDir } from '../server/bin/agent-dir.mjs';
+import {
+  describeActivity,
+  IDLE,
+  StatusThrottle,
+  THINKING,
+  type StatusTarget,
+} from '../src/presence-status.ts';
 import { beginCompaction, compactionInFlight, endCompaction, PRINNY_OWNER } from '../src/compaction-lock.ts';
 import { ChannelLifecycle } from '../src/channel-lifecycle.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
@@ -1483,6 +1490,77 @@ async function syncPersonaProfile(): Promise<void> {
   }
 }
 
+// ── the status bubble ────────────────────────────────────────────────────────
+//
+// What the session is doing, published as the Matrix status message. Driven
+// entirely from the turn lifecycle: no tool, no schema, no tokens.
+//
+// The whole design is one measured fact. On the homeserver this was built
+// against, a presence write followed ~3s later by a second one is refused with
+// 429 — so a status that tracked every tool call would spend its budget in the
+// first seconds of a turn and be throttled for the rest. The throttle coalesces
+// (latest wins, at most one write per interval) and a refusal reschedules with
+// whatever the status is BY THEN, not with the value that was refused.
+const statusThrottle = new StatusThrottle();
+let statusTimer: ReturnType<typeof setTimeout> | null = null;
+
+function offerStatus(statusMsg: string): void {
+  if (settings.presenceStatus !== 'on') return;
+  if (!child?.running) return;
+  // An empty status still needs a presence, and idle is `online` rather than
+  // `unavailable`: the session IS reachable, it just is not doing anything.
+  statusThrottle.offer({ presence: 'online', statusMsg });
+  scheduleStatusFlush();
+}
+
+function scheduleStatusFlush(): void {
+  if (statusTimer) return;
+  const wait = statusThrottle.waitMs(Date.now());
+  if (!Number.isFinite(wait)) return;
+  statusTimer = setTimeout(() => {
+    statusTimer = null;
+    void flushStatus();
+  }, wait);
+  // A pending status must never hold the process open — an idle session with a
+  // scheduled flush would otherwise refuse to exit.
+  statusTimer.unref?.();
+}
+
+async function flushStatus(): Promise<void> {
+  const now = Date.now();
+  const target: StatusTarget | null = statusThrottle.due(now);
+  if (!target) {
+    scheduleStatusFlush();
+    return;
+  }
+  if (!child?.running) return;
+  try {
+    const result = await callSidecar('set_presence', {
+      presence: target.presence,
+      status_msg: target.statusMsg,
+    });
+    const parsed = JSON.parse(result.content[0]?.text ?? '{}') as {
+      ok?: boolean;
+      rateLimited?: boolean;
+      retryAfterMs?: number;
+    };
+    if (parsed.rateLimited) {
+      statusThrottle.rateLimited(Date.now(), parsed.retryAfterMs);
+      log(`status bubble: rate limited, retrying in ${parsed.retryAfterMs ?? 'the default'}ms`);
+    } else if (parsed.ok) {
+      statusThrottle.wrote(Date.now(), target);
+    } else {
+      // A non-429 failure is not worth retrying on a timer; the next lifecycle
+      // event will offer again.
+      statusThrottle.wrote(Date.now(), target);
+    }
+  } catch (err) {
+    log(`status bubble: set_presence failed: ${err}`);
+    statusThrottle.rateLimited(Date.now());
+  }
+  scheduleStatusFlush();
+}
+
 /**
  * Send the run's answer, and continue the run if it produced none.
  *
@@ -2168,6 +2246,8 @@ Settings
                                 how much of the answer goes to Matrix by itself
   /prinny set personaProfile <on|off>
                                 wear the active persona's name and face
+  /prinny set presenceStatus <on|off>
+                                publish what the session is doing as the status
   /prinny permissions <off|dangerous|all>
 
 Credentials
@@ -2697,6 +2777,7 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
   // the auto-reply — which have no event of their own to ride on.
   pi.on('agent_start', async (_event, ctx) => {
     uiCtx = ctx;
+    offerStatus(THINKING);
     // "Working…" is up from here. A room already live from an earlier queued
     // message starts showing typing again immediately.
     agentRunning = true;
@@ -2710,6 +2791,17 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
    * Awaited deliberately: pi runs message handlers in order, and letting two
    * sends race would reorder somebody's conversation.
    */
+  // What the session is doing, for the status bubble. `tool_execution_start`
+  // carries the tool name and its arguments, which is what makes the line
+  // specific — "reading src/prompt.ts" rather than "working". An unrecognised
+  // tool returns null and the previous, more specific line stands rather than
+  // being replaced by something vaguer.
+  pi.on('tool_execution_start', async (event) => {
+    const e = event as unknown as { toolName?: string; args?: unknown };
+    const line = describeActivity(e.toolName ?? '', e.args);
+    if (line) offerStatus(line);
+  });
+
   pi.on('message_end', async (event) => {
     const message = event.message as { role?: unknown; content?: unknown } | undefined;
 
@@ -2754,6 +2846,9 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
     // event to hang this on — a settled run is the cheapest reliable moment.
     // Everything past the change check is skipped in the common case.
     void syncPersonaProfile();
+    // Nothing in flight: clear the bubble rather than leave the last tool call
+    // standing for hours, which reads as a session that got stuck there.
+    offerStatus(IDLE);
     // Cleared before forwarding, so the indicator is down by the time the answer
     // lands rather than a beat after it — a bot still "typing" next to a
     // finished reply reads as though more is coming.
