@@ -13,8 +13,11 @@ import { join } from 'node:path';
 
 import { describe, expect, it, siblingPath, skipWithoutSibling } from './harness.ts';
 import {
+  DESCRIPTION_MAX,
   findAvatarUrl,
+  parsePersonaDescription,
   parsePersonaName,
+  SHORT_DESCRIPTION_MAX,
   profileChanged,
   profileTarget,
   readActivePersona,
@@ -45,8 +48,46 @@ describe('reading the active persona', () => {
     expect(readActivePersona(root)).toEqual({
       name: 'Crystal',
       avatarUrl: 'https://avatars.example/crystal.png',
+      shortDescription: null,
+      description: null,
     });
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads the advertised description written by the extraction turn', () => {
+    const root = agentDir();
+    writeFileSync(
+      join(root, 'PERSONA.md'),
+      `${FRAMING('Crystal')}\n\nShort description: A shy fox-girl who calls you master.\nDescription: Crystal stammers when flustered and brightens when given a task.`,
+      'utf8'
+    );
+    const persona = readActivePersona(root)!;
+    expect(persona.shortDescription).toBe('A shy fox-girl who calls you master.');
+    expect(persona.description).toBe(
+      'Crystal stammers when flustered and brightens when given a task.'
+    );
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // A persona from before the description existed advertises none. The name
+  // still goes out — the absence must not cost the whole profile.
+  it('a persona without a description still yields a name', () => {
+    const root = agentDir();
+    writeFileSync(join(root, 'PERSONA.md'), FRAMING('Crystal'), 'utf8');
+    const persona = readActivePersona(root)!;
+    expect(persona.name).toBe('Crystal');
+    expect(persona.shortDescription).toBe(null);
+    expect(persona.description).toBe(null);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // "Description:" is a suffix of "Short description:". A loose match reads the
+  // short line as the long one and the two come out identical for every
+  // persona — which looks like it works.
+  it('does not read the short line as the long one', () => {
+    const d = parsePersonaDescription('Short description: the short one.\nDescription: the long one.');
+    expect(d.short).toBe('the short one.');
+    expect(d.long).toBe('the long one.');
   });
 
   it('is null when no persona is active', () => {
@@ -60,7 +101,12 @@ describe('reading the active persona', () => {
   it('gives a name with no avatar when the library has no image', () => {
     const root = agentDir();
     writeFileSync(join(root, 'PERSONA.md'), FRAMING('Ada Lovelace'), 'utf8');
-    expect(readActivePersona(root)).toEqual({ name: 'Ada Lovelace', avatarUrl: null });
+    expect(readActivePersona(root)).toEqual({
+      name: 'Ada Lovelace',
+      avatarUrl: null,
+      shortDescription: null,
+      description: null,
+    });
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -176,6 +222,28 @@ describe('the two packages agree about the persona files', {
 
   // The avatar URL only exists because pi-persona stores it. If it stopped, this
   // feature would silently do half its job.
+  it('on the description parser and its budgets', async () => {
+    const storage = await import(siblingPath('pi-persona', 'src/storage.ts') as string);
+    // The budgets are @prinny/bot's Limits, duplicated in both packages because
+    // neither may import the other. Three copies, asserted equal here.
+    expect(SHORT_DESCRIPTION_MAX).toBe(storage.SHORT_DESCRIPTION_MAX);
+    expect(DESCRIPTION_MAX).toBe(storage.DESCRIPTION_MAX);
+    const md = 'Short description: short.\nDescription: long.';
+    expect(parsePersonaDescription(md)).toEqual(storage.parsePersonaDescription(md));
+    const over = `Description: ${'x'.repeat(900)}`;
+    expect(parsePersonaDescription(over).long).toBe(storage.parsePersonaDescription(over).long);
+  });
+
+  it('that the extraction prompt still asks for a description at all', async () => {
+    // If it stopped, every persona would advertise a name and nothing else, and
+    // nothing here would fail — the parser would just always return null.
+    const { EXTRACTION_PROMPT } = await import(
+      siblingPath('pi-persona', 'src/processor.ts') as string
+    );
+    expect(EXTRACTION_PROMPT.includes('Short description:')).toBe(true);
+    expect(EXTRACTION_PROMPT.includes(`<= ${SHORT_DESCRIPTION_MAX} characters`)).toBe(true);
+  });
+
   it('that meta.json still carries avatarUrl', async () => {
     const storage = await import(siblingPath('pi-persona', 'src/storage.ts') as string);
     const root = agentDir();

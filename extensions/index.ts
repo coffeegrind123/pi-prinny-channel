@@ -1485,6 +1485,26 @@ async function syncPersonaProfile(): Promise<void> {
     return;
   }
 
+  // The ADVERTISED identity, which is a different thing from the Matrix account
+  // profile above: app.prinny.bot.info, republished into every joined room. The
+  // description is written by pi-persona's extraction turn as two labelled
+  // lines; a persona from before that existed simply advertises none, and the
+  // name still goes out.
+  const persona = readActivePersona(agentDir());
+  if (persona) {
+    try {
+      await callSidecar('set_bot_profile', {
+        name: persona.name,
+        ...(persona.description ? { description: persona.description } : {}),
+        ...(persona.shortDescription ? { short_description: persona.shortDescription } : {}),
+      });
+    } catch (err) {
+      // Advertising is cosmetic; the display name and avatar below are not, and
+      // must not be lost to a failure here.
+      log(`persona profile: could not advertise bot info: ${err}`);
+    }
+  }
+
   try {
     await callSidecar('set_profile', args);
     appliedProfile = target;

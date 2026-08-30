@@ -2635,11 +2635,28 @@ real timestamp, so the very first cooldown was untestable and an act at epoch 0
 could have run twice. `undefined` means never now, and a test pins the
 distinction.
 
-### Not built: `description`
+### `description` — reversed, and built (AQ6)
 
-The third thing suggested. Checked twice against the client and it renders
-**nowhere** a person in a room would see — `description` is consumed only by the
-server-browser listing and `short_description` by nothing at all. A persona
-changing it would be invisible, so it is not wired.
+Twice written up here as not worth building: nothing renders it, so a persona
+changing it would be invisible. That finding still stands as far as it goes —
+searching both clients turns up no view that shows a bot's description to
+somebody in a room.
+
+It is built anyway, and the reason is a better one than the objection.
+`description` is not a thing the persona *changes from time to time*, which is
+how it was first proposed and why it looked like spam-with-no-audience. It is
+part of **who the persona is**, written once by the extraction turn along with
+the name, and published with it. Every prinny client already parses it
+(`sanitizeBotInfo` is in the shipped bundles), so the field is populated and
+forward-compatible the day something renders it, and it costs one call inside a
+sync that was already happening.
+
+`pi-persona`'s extraction turn writes two labelled lines; `readActivePersona`
+reads them here with this package's own copy of that parser, and
+`syncPersonaProfile` publishes them through `set_bot_profile` →
+`bot.setMyProfile`, which republishes `app.prinny.bot.info` into every joined
+room. A persona from before the lines existed advertises a name and nothing else,
+and the advertising failing never costs the display name and avatar, which are
+the parts people can actually see.
 
 652 tests, up from 638.

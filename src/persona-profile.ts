@@ -32,6 +32,47 @@ export interface PersonaIdentity {
   name: string;
   /** Card image, when the library has one for this persona. */
   avatarUrl: string | null;
+  /** One standalone sentence introducing the character, or null. */
+  shortDescription: string | null;
+  /** Two or three sentences on who they are, or null. */
+  description: string | null;
+}
+
+/**
+ * Budgets for the advertised profile, from `@prinny/bot`'s `Limits` (which are
+ * Telegram's). Duplicated here for the same reason the compaction lock keeps
+ * three copies of its protocol — packages here do not import each other — and
+ * `tests/persona-profile.test.ts` asserts this copy, `Limits`, and
+ * `pi-persona`'s copy all agree.
+ */
+export const SHORT_DESCRIPTION_MAX = 120;
+export const DESCRIPTION_MAX = 512;
+
+/**
+ * The two labelled lines `pi-persona`'s extraction turn writes.
+ *
+ * A second copy of that package's `parsePersonaDescription`. Both are optional:
+ * a persona extracted before they existed, or written by hand, advertises no
+ * description, and that is not an error.
+ *
+ * `Description:` is a SUFFIX of `Short description:`, so the match is anchored
+ * to the start of a line — a loose one reads the short line as the long one and
+ * the two come out identical for every persona, which looks like it works.
+ */
+export function parsePersonaDescription(md: string): {
+  short: string | null;
+  long: string | null;
+} {
+  const one = (label: string, max: number): string | null => {
+    const m = md.match(new RegExp(`^${label}:[ \\t]*(.+)$`, 'im'));
+    const value = m?.[1]?.trim();
+    if (!value) return null;
+    return value.length <= max ? value : `${value.slice(0, max - 1)}\u2026`;
+  };
+  return {
+    short: one('Short description', SHORT_DESCRIPTION_MAX),
+    long: one('Description', DESCRIPTION_MAX),
+  };
 }
 
 /**
@@ -117,7 +158,13 @@ export function readActivePersona(agentDir: string): PersonaIdentity | null {
   }
   const name = parsePersonaName(md);
   if (!name) return null;
-  return { name, avatarUrl: findAvatarUrl(agentDir, name) };
+  const described = parsePersonaDescription(md);
+  return {
+    name,
+    avatarUrl: findAvatarUrl(agentDir, name),
+    shortDescription: described.short,
+    description: described.long,
+  };
 }
 
 /**

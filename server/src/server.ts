@@ -649,6 +649,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      // Internal. `setMyProfile` republishes app.prinny.bot.info into every
+      // joined room, so this is the advertised identity rather than the Matrix
+      // account profile that `set_profile` writes.
+      name: 'set_bot_profile',
+      description:
+        "Advertise the bot's name and description (app.prinny.bot.info). Internal — driven by the harness.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          description: { type: 'string' },
+          short_description: { type: 'string' },
+        },
+      },
+    },
+    {
       name: 'react',
       description:
         'Add an emoji reaction to a message. Matrix accepts any emoji — there is no whitelist.',
@@ -923,6 +939,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           }
           throw err;
         }
+      }
+
+      case 'set_bot_profile': {
+        const profile: { name?: string; description?: string; short_description?: string } = {};
+        if (typeof args.name === 'string' && args.name.trim()) profile.name = args.name.trim();
+        if (typeof args.description === 'string') profile.description = args.description;
+        if (typeof args.short_description === 'string') profile.short_description = args.short_description;
+        // setMyProfile republishes to every joined room when the bot is running,
+        // so this is one call rather than a loop, and a room where the bot lacks
+        // power to set state falls back to a timeline event on its own.
+        await requireBot().setMyProfile(profile);
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, published: Object.keys(profile) }) }] };
       }
 
       case 'react': {
