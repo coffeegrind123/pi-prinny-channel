@@ -2561,3 +2561,85 @@ what earn the **BOT badge** and the `/`-autocomplete, so that half was already
 working.
 
 638 tests, up from 620.
+
+## AQ5 — letting the persona be present, without letting it spam
+
+With a persona active the bot already wears a name and a face (AQ3) and the
+harness publishes what the session is doing (AQ4). This is the third piece: two
+things the CHARACTER can do to the room, so it reads as somebody who is there
+rather than a process that answers when poked.
+
+```
+  prinny(action: "status", { text })   the line under your name — ambient
+  prinny(action: "topic",  { topic })  the room's subject — a state event
+```
+
+### "Occasionally" is not something a prompt can promise
+
+A model told "do this from time to time" does it every turn for a while and then
+never. And on this stack there is a second reason not to leave it to wording:
+presence writes are rate-limited by the homeserver (AQ4's measurements), so a
+chatty persona would simply be refused and would read the refusal as a broken
+tool.
+
+**So the bound is in code and the prompt is told about the bound**, rather than
+asked to respect one. `src/immersion-acts.ts` holds both windows:
+
+| act | window | why |
+| --- | --- | --- |
+| `status` | 10 minutes | ambient — it sits under a display name, nobody is notified |
+| `topic` | 1 hour | a **state event**: it lands in the timeline, every client shows it, some rooms ping on it |
+
+A call inside the window is refused, and **the wording of that refusal is the
+load-bearing part**:
+
+> Not yet — the status was set 3 minutes ago and changes are limited to one per
+> 10 minutes so the room is not spammed. This is a normal refusal, not a failure:
+> carry on with what you were doing and do not mention it or retry. You can set
+> it again in 7 minutes.
+
+A model that reads "refused" as "failed" starts apologising to the user, or
+retrying, or explaining itself — all worse than the spam. The test asserts the
+sentence contains neither "error" nor "failed", and its control is that the
+cooldown genuinely refuses, since a policy that allowed everything would pass any
+assertion about wording.
+
+### The nudge is doubly gated
+
+Added in `before_agent_start` **only when a persona is active AND the channel is
+running**, re-checked every turn because both change mid-session (`/persona`,
+`/prinny`). With no channel the acts cannot happen and describing them is dead
+tokens; with no persona they are not wanted, because a neutral session has no
+business setting a mood on somebody's room.
+
+Its most important sentence is the counterweight — **"Doing neither is the normal
+case… most turns warrant nothing at all, and a status that changes every few
+minutes is worse than none, because it stops meaning anything."** Without it a
+model reads any mention of a capability as an instruction to exercise it, which
+is the exact failure the cooldowns exist to catch.
+
+### A persona status outlives the run
+
+The two status sources had to be reconciled rather than left to race. The
+automatic activity line (AQ4) is informative; a persona status is flavour. So the
+activity line shows while the session works, and on `agent_settled` the bubble
+falls back to the **persona's** status instead of clearing to empty — a
+character's chosen line survives the turn that interrupted it. The throttle is
+told about the model's write, or the next automatic update would think the server
+already said something else.
+
+### A falsy-number trap, caught by a test that could not run
+
+`check()` used `if (!lastAt || …)` to mean "never ran". `0` is falsy and also a
+real timestamp, so the very first cooldown was untestable and an act at epoch 0
+could have run twice. `undefined` means never now, and a test pins the
+distinction.
+
+### Not built: `description`
+
+The third thing suggested. Checked twice against the client and it renders
+**nowhere** a person in a room would see — `description` is consumed only by the
+server-browser listing and `short_description` by nothing at all. A persona
+changing it would be invisible, so it is not wired.
+
+652 tests, up from 638.

@@ -99,6 +99,26 @@ every 8 seconds), so updates are coalesced — at most one write per 12s, always
 the latest value, and a refusal is retried with whatever the status is by then
 rather than with the value that was refused.
 
+## Being present, with a persona
+
+With [pi-persona](https://github.com/coffeegrind123/pi-persona) active, the
+character can act on the room itself:
+
+```
+prinny(action: "status", { text })    the line under your name — one per 10 min
+prinny(action: "topic",  { topic })   the room's subject — one per hour
+```
+
+Both are rate limited **in code**, not by asking the model nicely, and a call
+inside the window is refused with a sentence that says the refusal is normal so
+it does not get retried or apologised for. The system-prompt nudge appears only
+when a persona is active *and* the channel is running, and its loudest sentence
+is that doing neither is the normal case.
+
+A status the persona sets outlives the run: the automatic activity line shows
+while the session works, then falls back to the character's own line rather than
+clearing.
+
 ## Permissions
 
 `/prinny permissions <off|dangerous|all>` relays tool calls to Matrix for

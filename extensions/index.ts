@@ -117,6 +117,13 @@ import {
   THINKING,
   type StatusTarget,
 } from '../src/presence-status.ts';
+import {
+  check as checkImmersion,
+  clampStatus,
+  clampTopic,
+  immersionNudge,
+  type ImmersionAct,
+} from '../src/immersion-acts.ts';
 import { beginCompaction, compactionInFlight, endCompaction, PRINNY_OWNER } from '../src/compaction-lock.ts';
 import { ChannelLifecycle } from '../src/channel-lifecycle.ts';
 import { classifyMatrixCommand } from '../src/command-routing.ts';
@@ -1503,6 +1510,17 @@ async function syncPersonaProfile(): Promise<void> {
 // whatever the status is BY THEN, not with the value that was refused.
 const statusThrottle = new StatusThrottle();
 let statusTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * The status the PERSONA chose, if it has chosen one.
+ *
+ * Outlives a run. The automatic activity line shows what the session is doing
+ * while it works; when the run settles the bubble falls back to this rather than
+ * clearing to nothing, so a character's "curled up with the compiler" survives
+ * the turn that interrupted it.
+ */
+let personaStatus = '';
+/** When each immersion act last ran, for the cooldowns. */
+const lastImmersionAt: Partial<Record<ImmersionAct, number>> = {};
 
 function offerStatus(statusMsg: string): void {
   if (settings.presenceStatus !== 'on') return;
@@ -1938,6 +1956,20 @@ const ACTIONS: Record<string, { sidecar: string; needs: string; note?: string }>
   //   note: 'only for attachments, quote-replies or a second message — your written answer is sent for you',
   // },
   react: { sidecar: 'react', needs: 'emoji; optional message_id (defaults to the message you are answering)' },
+  // Immersion acts. Present whether or not a persona is active — setting a topic
+  // is useful either way — but only ENCOURAGED when one is, by the nudge in
+  // before_agent_start. Both are rate limited in code (../src/immersion-acts.ts),
+  // and a refusal inside the window is a normal answer rather than an error.
+  status: {
+    sidecar: 'set_presence',
+    needs: 'text (empty clears it)',
+    note: 'the line under your name; ambient, nobody is notified. One change per 10 minutes',
+  },
+  topic: {
+    sidecar: 'set_topic',
+    needs: 'topic (empty clears it)',
+    note: 'a state event everyone sees in the timeline. One change per hour; needs power in the room',
+  },
   edit: {
     sidecar: 'edit_message',
     needs: 'message_id, text',
@@ -2091,6 +2123,38 @@ function registerTools(pi: ExtensionAPI): void {
           return `prinny(${params.action}) needs a message_id and none is known for this turn.`;
         }
         args.message_id = lastInbound.messageId;
+      }
+
+      // Immersion acts are bounded HERE, not in the prompt — a model told "from
+      // time to time" does it every turn and then never. See
+      // ../src/immersion-acts.ts for why the refusal is worded as a normal
+      // answer rather than a failure.
+      if (params.action === 'status' || params.action === 'topic') {
+        const act = params.action as ImmersionAct;
+        const verdict = checkImmersion(act, lastImmersionAt[act], Date.now());
+        if (!verdict.allowed) return verdict.reason;
+
+        if (act === 'status') {
+          // The model's status is the PERSONA's, and it outlives the run: the
+          // automatic activity bubble shows what the session is doing while it
+          // works, then falls back to this instead of clearing to nothing.
+          const text = clampStatus(String(args.text ?? ''));
+          personaStatus = text;
+          delete args.text;
+          delete args.room_id; // presence is account-wide, not per room
+          args.presence = 'online';
+          args.status_msg = text;
+        } else {
+          args.topic = clampTopic(String(args.topic ?? ''));
+        }
+        const done = await callSidecar(spec.sidecar, args);
+        lastImmersionAt[act] = Date.now();
+        if (act === 'status') {
+          // Keep the throttle's view honest, or the next automatic update would
+          // think the server already says something else.
+          statusThrottle.wrote(Date.now(), { presence: 'online', statusMsg: personaStatus });
+        }
+        return done;
       }
 
       const result = await callSidecar(spec.sidecar, args);
@@ -2775,6 +2839,37 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
 
   // Keep a usable context for the async paths — child output, notifications,
   // the auto-reply — which have no event of their own to ride on.
+  /**
+   * The immersion nudge: added ONLY when a persona is active and the channel is
+   * running.
+   *
+   * Absent otherwise, for two different reasons. With no channel the acts cannot
+   * happen and describing them is dead tokens. With no persona they are not
+   * wanted — a neutral session has no business setting a mood on somebody's
+   * room. Both conditions are re-checked every turn because both can change
+   * mid-session: a persona is adopted with /persona, and the channel is started
+   * and stopped with /prinny.
+   *
+   * pi chains before_agent_start handlers, so this appends after
+   * vendor/pi-persona has prepended its block — which is the right order: the
+   * persona block establishes who is speaking, and this says what they can do
+   * about it.
+   */
+  pi.on('before_agent_start', async (event) => {
+    try {
+      if (!child?.running) return undefined;
+      const persona = readActivePersona(agentDir());
+      if (!persona) return undefined;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n${immersionNudge(persona.name, true)}`,
+      };
+    } catch (err) {
+      // A nudge that cannot be built must never cost the turn.
+      log(`immersion nudge skipped: ${err}`);
+      return undefined;
+    }
+  });
+
   pi.on('agent_start', async (_event, ctx) => {
     uiCtx = ctx;
     offerStatus(THINKING);
@@ -2846,9 +2941,11 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
     // event to hang this on — a settled run is the cheapest reliable moment.
     // Everything past the change check is skipped in the common case.
     void syncPersonaProfile();
-    // Nothing in flight: clear the bubble rather than leave the last tool call
-    // standing for hours, which reads as a session that got stuck there.
-    offerStatus(IDLE);
+    // Nothing in flight. Fall back to the persona's own status if it set one —
+    // clearing to nothing would throw away a line the character chose — and
+    // otherwise clear, rather than leave the last tool call standing for hours,
+    // which reads as a session that got stuck there.
+    offerStatus(personaStatus || IDLE);
     // Cleared before forwarding, so the indicator is down by the time the answer
     // lands rather than a beat after it — a bot still "typing" next to a
     // finished reply reads as though more is coming.

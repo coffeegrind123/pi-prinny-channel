@@ -636,6 +636,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'set_topic',
+      description:
+        "Set a room's topic. Requires permission to send m.room.topic there; says so plainly when it does not have it.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          room_id: ROOM_ID_SCHEMA,
+          topic: { type: 'string', description: 'Empty string clears it.' },
+        },
+        required: ['topic'],
+      },
+    },
+    {
       name: 'react',
       description:
         'Add an emoji reaction to a message. Matrix accepts any emoji — there is no whitelist.',
@@ -886,6 +899,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               },
             ],
           };
+        }
+      }
+
+      case 'set_topic': {
+        assertTargetRoom(roomId);
+        const client = requireBot().matrixClient;
+        const topic = typeof args.topic === 'string' ? args.topic : '';
+        try {
+          await client.setRoomTopic(roomId, topic);
+          return { content: [{ type: 'text', text: topic ? `topic set: ${topic}` : 'topic cleared' }] };
+        } catch (err) {
+          // A bot usually joins a room without power to set state. That is an
+          // ordinary configuration fact, not a bug, and it has to read as one:
+          // "M_FORBIDDEN" alone sends the model looking for a permissions
+          // problem in this package.
+          const code = (err as { errcode?: string }).errcode;
+          if (code === 'M_FORBIDDEN') {
+            throw new Error(
+              'not allowed to set the topic in this room — the bot needs a power level that ' +
+                'permits m.room.topic. Ask the room admin, or leave the topic alone.'
+            );
+          }
+          throw err;
         }
       }
 
