@@ -29,9 +29,9 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } fro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { siblingPath, skipWithoutSibling } from './harness.ts';
 
 import { quarantine, quarantineName, readJsonObject, writeJsonAtomic } from '../src/json-store.ts';
-import * as subagents from '../../pi-subagents-lite/src/config/json-store.ts';
 import { DEFAULT_SETTINGS, readSettings, readSettingsLayer, writeSettings } from '../src/config.ts';
 
 function scratch(): string {
@@ -131,7 +131,15 @@ describe('AN1 — writeSettings never silently replaces an unreadable file', () 
   });
 });
 
-describe('the two copies of the rule agree', () => {
+// Skipped when pi-subagents-lite is not checked out beside this package; it MUST
+// run in instantcoffee, where both copies live, and that repo's CI asserts it did.
+const SUB_SKIP = skipWithoutSibling('pi-subagents-lite', 'src/config/json-store.ts');
+const loadSubagents = async () =>
+  (await import(
+    siblingPath('pi-subagents-lite', 'src/config/json-store.ts') as string
+  )) as typeof import('../src/json-store.ts');
+
+describe('the two copies of the rule agree', { skip: SUB_SKIP }, () => {
   const cases: Array<[string, string]> = [
     ['absent', ''],
     ['malformed', '{ "a": 1 '],
@@ -140,7 +148,8 @@ describe('the two copies of the rule agree', () => {
     ['absent', '   \n '],
   ];
 
-  it('readJsonObject gives the same verdict on both sides', () => {
+  it('readJsonObject gives the same verdict on both sides', async () => {
+    const subagents = await loadSubagents();
     const dir = scratch();
     for (const [expected, body] of cases) {
       const file = join(dir, `case-${cases.indexOf([expected, body])}-${body.length}.json`);
@@ -153,12 +162,14 @@ describe('the two copies of the rule agree', () => {
     }
   });
 
-  it('quarantineName is the same name on both sides', () => {
+  it('quarantineName is the same name on both sides', async () => {
+    const subagents = await loadSubagents();
     const at = Date.parse('2026-08-23T06:40:50.341Z');
     assert.equal(quarantineName('/tmp/pi.json', at), subagents.quarantineName('/tmp/pi.json', at));
   });
 
-  it('quarantine moves the file on both sides', () => {
+  it('quarantine moves the file on both sides', async () => {
+    const subagents = await loadSubagents();
     const dir = scratch();
     for (const [i, mover] of [quarantine, subagents.quarantine].entries()) {
       const file = join(dir, `move-${i}.json`);
@@ -169,7 +180,8 @@ describe('the two copies of the rule agree', () => {
     }
   });
 
-  it('writeJsonAtomic leaves the same bytes on both sides', () => {
+  it('writeJsonAtomic leaves the same bytes on both sides', async () => {
+    const subagents = await loadSubagents();
     const dir = scratch();
     const a = join(dir, 'a.json');
     const b = join(dir, 'b.json');

@@ -314,3 +314,67 @@ export function runtimeAvailable(): boolean {
 export const RUNTIME_DIST = DIST;
 export const RUNTIME_ROOT = RUNTIME;
 export const SERVER_PAYLOAD_ROOT = PAYLOAD_ROOT;
+
+// ── sibling vendor packages ──────────────────────────────────────────────────
+//
+// Four suites here read ANOTHER package's source to assert that a duplicated
+// protocol literal still agrees: the compaction lock (three copies), the
+// approved-command key shared with rtk-pi, the agent-dir rule, and the
+// json-store rule. Vendor packages in the origin stack must not IMPORT each
+// other — that is the constraint those duplications exist to satisfy — so the
+// tests read across instead, by relative path.
+//
+// That works when this package sits in instantcoffee's `vendor/`, next to its
+// siblings. It does not work in this repo on its own, where there is no
+// `../rtk-pi`. Before, that presented as seven hard failures and 21 suites that
+// never loaded.
+//
+// So the suites skip when the sibling is absent, the way tests/binary.test.ts in
+// rtk-pi skips when the rtk binary is not installed. The important half: in
+// instantcoffee they must NOT skip, because a silently-skipped agreement test is
+// how three copies of a protocol drift apart. That repo's CI asserts they ran.
+//
+// PRINNY_SIBLING_ROOT overrides the search for a checkout laid out differently.
+
+import { existsSync as siblingExists } from 'node:fs';
+import { dirname as siblingDirname, join as siblingJoin } from 'node:path';
+import { fileURLToPath as siblingFileURL } from 'node:url';
+
+/** Absolute path to a file inside a sibling vendor package, or null. */
+export function siblingPath(pkg: string, relative: string): string | null {
+  const here = siblingDirname(siblingDirname(siblingFileURL(import.meta.url)));
+  const roots = [
+    process.env.PRINNY_SIBLING_ROOT,
+    siblingDirname(here), // ../  — vendor/, when this package lives in vendor/
+  ].filter((r): r is string => typeof r === 'string' && r.length > 0);
+  for (const root of roots) {
+    const candidate = siblingJoin(root, pkg, relative);
+    if (siblingExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** A `{ skip }` option for node:test, explaining itself when the sibling is absent. */
+export function skipWithoutSibling(pkg: string, relative: string): false | string {
+  return siblingPath(pkg, relative)
+    ? false
+    : `${pkg} is not checked out beside this package — cross-source agreement is asserted in instantcoffee's CI`;
+}
+
+/**
+ * A file in the CONSUMING stack, two directories above this package.
+ *
+ * `vendor/<pkg>/tests/..` -> `vendor/..` -> the stack root. Present when this
+ * package is a submodule inside instantcoffee, absent in this repo on its own.
+ * PRINNY_STACK_ROOT overrides it.
+ */
+export function stackFile(relative: string): string | null {
+  const here = siblingDirname(siblingDirname(siblingFileURL(import.meta.url)));
+  const roots = [process.env.PRINNY_STACK_ROOT, siblingDirname(siblingDirname(here))]
+    .filter((r): r is string => typeof r === 'string' && r.length > 0);
+  for (const root of roots) {
+    const candidate = siblingJoin(root, relative);
+    if (siblingExists(candidate)) return candidate;
+  }
+  return null;
+}

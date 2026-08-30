@@ -1,5 +1,15 @@
 # prinny-channel — converted to a pi extension
 
+> **This package now lives in its own repository**
+> ([coffeegrind123/pi-prinny-channel](https://github.com/coffeegrind123/pi-prinny-channel)).
+> It was built inside
+> [instantcoffee](https://github.com/coffeegrind123/instantcoffee), which still
+> consumes it as a submodule at `vendor/prinny-channel`, loaded by absolute path.
+> References below to `scripts/pi-local.sh`, `.env`, `vendor/…` and
+> `context/design/…` are that stack's; they are kept because they are where the
+> measurements were taken, not because this package needs them.
+
+
 Converted from [`prinny-channel`](https://github.com/coffeegrind123/prinny-channel)
 (MIT — `LICENSE` is upstream's, unchanged), which is a **Claude Code plugin**:
 an MCP server that Claude Code launches, plus two skills. pi has no plugin

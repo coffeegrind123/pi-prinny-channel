@@ -1,18 +1,34 @@
 {
   "name": "pi-prinny-channel",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Matrix channel for pi \u2014 talk to a pi session, and the local model behind it, from any Matrix client",
   "keywords": [
     "pi-package",
     "pi",
+    "pi-agent",
+    "pi-coding-agent",
+    "pi-extension",
     "matrix",
     "channel",
     "prinny",
-    "messaging"
+    "messaging",
+    "e2ee",
+    "bot"
   ],
   "license": "MIT",
+  "author": "coffeegrind123",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coffeegrind123/pi-prinny-channel.git"
+  },
+  "homepage": "https://github.com/coffeegrind123/pi-prinny-channel#readme",
+  "bugs": {
+    "url": "https://github.com/coffeegrind123/pi-prinny-channel/issues"
+  },
   "type": "module",
-  "private": true,
+  "engines": {
+    "node": ">=22.6.0"
+  },
   "scripts": {
     "prepare-runtime": "node server/bin/prinny-channel.mjs --prepare",
     "lint": "for file in extensions/index.ts src/*.ts server/src/*.ts tests/*.test.ts; do node --check \"$file\"; done && for file in server/bin/*.mjs; do node --check \"$file\"; done",
@@ -23,6 +39,15 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
+  "files": [
+    "extensions",
+    "src",
+    "server",
+    "skills",
+    "README.md",
+    "FORK.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "extensions"

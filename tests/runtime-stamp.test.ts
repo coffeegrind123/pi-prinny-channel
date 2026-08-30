@@ -39,7 +39,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { assertRuntimeMatchesSource } from './harness.ts';
+import { assertRuntimeMatchesSource, stackFile } from './harness.ts';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -212,8 +212,17 @@ describe('AN2 — the readers ask the same question', () => {
     assert.match(EXTENSION, /runtimeState\(\) === 'current' \? '' : /, 'configure prepares a stale runtime');
   });
 
-  it('the launcher asks the bootstrap rather than stat-ing the entry', () => {
-    const launcher = readFileSync(new URL('../../../scripts/pi-local.sh', import.meta.url), 'utf8');
+  // The fifth reader is the consuming STACK's launcher, not this package. It is
+  // instantcoffee's scripts/pi-local.sh, two directories above vendor/ — present
+  // when this package is a submodule there, absent in this repo on its own.
+  // Skipped rather than dropped: it is the reader whose wrong answer is a
+  // confusing timeout rather than an error, and instantcoffee's CI asserts it ran.
+  it('the launcher asks the bootstrap rather than stat-ing the entry', {
+    skip: stackFile('scripts/pi-local.sh')
+      ? false
+      : 'the consuming stack is not around this package — asserted in instantcoffee CI',
+  }, () => {
+    const launcher = readFileSync(stackFile('scripts/pi-local.sh') as string, 'utf8');
     assert.match(launcher, /--staged/, 'one node start, and it is the same answer');
   });
 });

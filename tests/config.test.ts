@@ -7,7 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it, loadServerModule, vi } from './harness.ts';
+import { afterEach, beforeEach, describe, expect, it, loadServerModule, siblingPath, skipWithoutSibling, vi } from './harness.ts';
 import { DEFAULT_SETTINGS, parseSetting, readSettings, stateDir, writeSettings } from '../src/config.ts';
 import { assistantTextOfMessage } from '../src/forwarding.ts';
 
@@ -201,12 +201,14 @@ describe('state directory', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('the two packages answer the same question the same way', async () => {
+  it('the two packages answer the same question the same way', {
+    skip: skipWithoutSibling('pi-subagents-lite', 'src/agent-dir.ts'),
+  }, async () => {
     // `vendor/pi-subagents-lite/src/agent-dir.ts` is the other copy of this
     // rule. Vendor packages here do not import each other, so the copies are
     // compared — the arrangement the compaction lock and json-store already use.
     const { agentDir: theirs } = await import(
-      '../../pi-subagents-lite/src/agent-dir.ts'
+      siblingPath('pi-subagents-lite', 'src/agent-dir.ts') as string
     );
     const { agentDir: ours } = await import('../server/bin/agent-dir.mjs');
     for (const value of ['~/pi-work', '~', '/opt/pi', '/tmp/~backup', '', 'relative/dir']) {

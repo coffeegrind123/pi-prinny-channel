@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { describe, expect, it, loadServerModule } from './harness.ts';
+import { describe, expect, it, loadServerModule, siblingPath, skipWithoutSibling } from './harness.ts';
 import {
   APPROVED_COMMAND_KEY,
   describeCall,
@@ -217,12 +217,17 @@ describe('the approved-command stamp', () => {
   });
 });
 
-describe('the two packages agree on the key', () => {
+// Skipped when rtk-pi is not beside this package. It MUST run in instantcoffee,
+// where both live and where load order makes the agreement load-bearing; that
+// repo's CI asserts it did not skip.
+const RTK_SKIP = skipWithoutSibling('rtk-pi', 'src/gate.ts');
+
+describe('the two packages agree on the key', { skip: RTK_SKIP }, () => {
   it("rtk-pi's source declares the same literal", () => {
     // Vendor packages must not import each other — the compaction lock keeps
     // three copies of its protocol for the same reason — so each side asserts
     // against the other's source.
-    const src = readFileSync(new URL('../../rtk-pi/src/gate.ts', import.meta.url), 'utf8');
+    const src = readFileSync(siblingPath('rtk-pi', 'src/gate.ts') as string, 'utf8');
     const declared = src.match(/export const APPROVED_COMMAND_KEY = "([^"]+)"/)?.[1];
     expect(declared).toBe(APPROVED_COMMAND_KEY);
   });
@@ -231,7 +236,7 @@ describe('the two packages agree on the key', () => {
     // The two literals matching is not the same fact as the two FUNCTIONS
     // agreeing, and only one of them is what a tool call depends on. Both sides
     // are pure, so the round trip can be run rather than reasoned about.
-    const { approvedAsWritten } = await import('../../rtk-pi/src/gate.ts');
+    const { approvedAsWritten } = await import(siblingPath('rtk-pi', 'src/gate.ts') as string);
     const input: Record<string, unknown> = { command: 'git status' };
     expect(approvedAsWritten(input)).toBe(false);
     markApproved(input, describeCall('bash', input));
@@ -239,7 +244,7 @@ describe('the two packages agree on the key', () => {
   });
 
   it('…and still reads it before it rewrites anything', () => {
-    const src = readFileSync(new URL('../../rtk-pi/extensions/index.ts', import.meta.url), 'utf8');
+    const src = readFileSync(siblingPath('rtk-pi', 'extensions/index.ts') as string, 'utf8');
     expect(src.includes('approvedAsWritten(event.input)')).toBe(true);
     expect(src.indexOf('approvedAsWritten(event.input)') < src.indexOf('event.input.command = rewritten')).toBe(true);
   });

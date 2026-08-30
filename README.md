@@ -1,0 +1,94 @@
+# pi-prinny-channel
+
+Talk to a [pi](https://pi.dev) session — and the local model behind it — from any
+Matrix client. A message from an allowlisted sender becomes a turn; the answer
+comes back to the room by itself.
+
+[![CI](https://github.com/coffeegrind123/pi-prinny-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/coffeegrind123/pi-prinny-channel/actions/workflows/ci.yml)
+
+Converted from the Claude Code plugin of the same name
+([coffeegrind123/prinny-channel](https://github.com/coffeegrind123/prinny-channel)).
+The Matrix half is upstream's; everything that touched Claude Code was rewritten
+for pi. `FORK.md` is the full account — it is long, and it is long because each
+section is an incident.
+
+## Install
+
+```bash
+pi install git:github.com/coffeegrind123/pi-prinny-channel@v1.0.0
+```
+
+Then, once:
+
+```
+/prinny prepare                                     ~1 min, builds the sidecar
+/prinny configure https://matrix.example.org @bot:matrix.example.org <password>
+# message the bot from your Matrix client — it replies with a code
+/prinny pair <code>
+/prinny policy allowlist                            stop handing out codes
+```
+
+`/prinny` on its own prints connection state, policy, allowlist, pending pairings
+and settings. `/prinny log` tails the channel's own log — the channel never
+writes to the terminal, because in pi stdout and stderr are the TUI.
+
+## How it is put together
+
+The Matrix layer runs as a **child process**, not inside pi. Loading
+matrix-js-sdk plus its Rust crypto blocks the event loop for ~15 seconds and
+writes to stdout on the way up; in-process that is a frozen TUI drawn over with
+library chatter. Its ~105 MB of dependencies are installed outside your repo, at
+`~/.pi/agent/channels/prinny/runtime`, by `/prinny prepare`.
+
+That runtime is a compiled copy of `server/src`, keyed on a content fingerprint,
+so it can be out of date. Everything that asks says which of three states it is
+in — `current`, `stale`, `absent` — and `/prinny start` refuses on `stale` rather
+than starting, because a stale runtime re-stages inside a 120-second connect
+budget and fails as `initialize timed out`, which reads as a broken channel
+rather than a rebuild.
+
+## Delivery
+
+```
+/prinny forward all      every assistant message as it completes (default)
+/prinny forward result   the whole turn, in order, as one message when it settles
+/prinny forward last     only the turn's closing text
+/prinny forward off      nothing unless the model calls the prinny tool
+
+/prinny set deliverAs steer      an inbound message lands mid-run (default)
+/prinny set deliverAs followUp   it waits for the agent to finish every tool call
+```
+
+**Only assistant `text` is ever forwarded** — thinking blocks and tool calls
+never are, in any mode. The filter is an allowlist on `type === "text"`, so a
+content kind a future pi adds is excluded by default rather than leaked.
+
+**The answer is forwarded, not requested.** Upstream made a `reply` tool the only
+way out, which holds at frontier scale and does not at 27B: the model writes a
+good answer into the transcript, never calls the tool, and the person on Matrix
+sees nothing while the operator sees a complete reply.
+
+## Permissions
+
+`/prinny permissions <off|dangerous|all>` relays tool calls to Matrix for
+approval. Off by default: pi has no built-in approval prompt, so adding friction
+it does not otherwise have would be a surprise rather than a feature.
+
+## Tests
+
+```bash
+npm run lint
+npm run test:unit      # 603, no network, no Matrix
+npm run prepare-runtime && npm test   # adds the e2e suite
+```
+
+## Security
+
+It logs a bot into a homeserver and makes a coding session addressable from the
+internet. Read `FORK.md`'s access and permission sections before pointing it at
+anything you care about, and prefer `/prinny policy allowlist` once you have
+paired the people you meant to.
+
+## License
+
+MIT.

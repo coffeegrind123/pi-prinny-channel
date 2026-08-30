@@ -34,7 +34,7 @@ import {
   endCompaction,
   resetCompactionLock,
 } from '../src/compaction-lock.ts';
-import * as loop from '../../pi-loop-mode/src/compaction-lock.ts';
+import { siblingPath, skipWithoutSibling } from './harness.ts';
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -79,23 +79,40 @@ describe('the compaction lock', () => {
   });
 });
 
-describe('the two implementations agree', () => {
+// Loaded lazily and skipped when the sibling is absent: this repo on its own has
+// no ../pi-loop-mode. In instantcoffee it is there and these MUST run — a
+// silently-skipped agreement test is how three copies of a protocol drift apart,
+// and that repo's CI asserts they did not skip.
+const LOOP_SKIP = skipWithoutSibling('pi-loop-mode', 'src/compaction-lock.ts');
+const loadLoop = async () =>
+  (await import(siblingPath('pi-loop-mode', 'src/compaction-lock.ts') as string)) as {
+    COMPACTION_LOCK_KEY: string;
+    STALE_MS: number;
+    LOOP_OWNER: string;
+    beginCompaction: (owner: string) => boolean;
+    endCompaction: (owner: string) => void;
+  };
+
+describe('the two implementations agree', { skip: LOOP_SKIP }, () => {
   beforeEach(() => {
     resetCompactionLock();
   });
 
-  it('on the key and the bound', () => {
+  it('on the key and the bound', async () => {
+    const loop = await loadLoop();
     assert.equal(loop.COMPACTION_LOCK_KEY, COMPACTION_LOCK_KEY);
     assert.equal(loop.STALE_MS, STALE_MS);
   });
 
-  it('and this package does not import that one', () => {
+  it('and this package does not import that one', async () => {
     const source = readFileSync(join(PACKAGE_ROOT, 'src', 'compaction-lock.ts'), 'utf8');
     assert.doesNotMatch(source, /from ["'].*pi-loop-mode/);
+    const loop = await loadLoop();
     assert.equal(loop.LOOP_OWNER, 'pi-loop-mode');
   });
 
-  it("so the loop's hold really does refuse this channel", () => {
+  it("so the loop's hold really does refuse this channel", async () => {
+    const loop = await loadLoop();
     assert.equal(loop.beginCompaction(loop.LOOP_OWNER), true);
     assert.equal(beginCompaction(PRINNY_OWNER), false, 'we must see the loop\'s hold');
     assert.equal(compactionInFlight()?.owner, loop.LOOP_OWNER);

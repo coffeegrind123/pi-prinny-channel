@@ -1,0 +1,42 @@
+name: CI
+
+# The failure mode this exists for: a broken channel does not error, it just
+# stops delivering, and the only witness is somebody on Matrix wondering why the
+# bot ignores them.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Lint
+        run: npm run lint
+
+      # The sidecar's Matrix dependencies are installed and compiled outside the
+      # repo, which is what --prepare does. The suite runs against that compiled
+      # output rather than a re-compile of it, so this is not optional setup —
+      # it builds the artifact under test.
+      - name: Build the sidecar runtime
+        run: npm run prepare-runtime
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      # Separate, and after pi is installed, so "pi would not install" is not
+      # reported as "the extension is broken". This is the step that catches a
+      # wrong notification method name — the extension's whole job, and something
+      # no unit test can see.
+      - name: Install pi
+        run: npm install -g @earendil-works/pi-coding-agent
+
+      - name: The extension inside a real pi
+        run: npm run test:e2e
