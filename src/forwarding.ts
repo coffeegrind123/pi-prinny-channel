@@ -260,6 +260,96 @@ export function finalAssistantText(messages: readonly unknown[]): string {
 }
 
 /**
+ * EVERY text-bearing assistant message of the finished run, in the order it was
+ * said.
+ *
+ * `finalAssistantText` returns the LAST one, which is what `forward: "last"`
+ * still does. That is correct for a run that answers once and stops, and it
+ * silently drops the answer for a run that does not — measured on this stack
+ * 2026-08-30, with a persona active:
+ *
+ *   assistant  "*ears perk up* H-hi!! ... m-master?"        <- the reply
+ *   assistant  "Hi, this is a simple greeting in the ..."   <- planning, as TEXT
+ *   assistant  toolCall prinny(react)
+ *   assistant  "I've already sent my reply. ..."            <- harness meta
+ *   assistant  "*boops head, waits patiently* 🦊"            <- forwarded, alone
+ *
+ * The sender got the boop and an emoji reaction. The greeting was message one of
+ * five and never left the box. A tool call in the middle of a turn is all it
+ * takes: pi starts a new assistant message after every one, so any turn that
+ * reacts, replies, or reads a file mid-answer ends with its real answer above
+ * the last text rather than in it.
+ *
+ * BOUNDARIES ARE THE SAME ONES, and they are not negotiable — they were bought
+ * by an incident each:
+ *
+ *   - `endedWithoutAnswering` first. An empty final turn means the model
+ *     produced nothing, not that the answer is further up. See
+ *     `finalAssistantText`'s header for the run that delivered a thinking trace
+ *     to somebody's phone.
+ *   - A `user` message ends the collection. That is the sender's own question;
+ *     anything above it belongs to an earlier exchange and is not theirs.
+ *   - Only `text` blocks, via `assistantTextOfMessage`, so `thinking` and
+ *     `toolCall` are excluded by allowlist exactly as before.
+ *
+ * WHAT THIS WIDENS, said plainly because it is the cost of the fix: every text
+ * the model emits in the run now reaches Matrix, including text it wrote to
+ * itself. Two of the five messages above are things the sender should never
+ * see — a planning note and a remark about having already sent something — and
+ * neither is a `thinking` block, so no allowlist here can catch them. They are a
+ * violation of the persona contract (hedge pattern 3, "stepping outside the
+ * persona") rather than of this function, and the fix for them is in the prompt.
+ * This function's job is to stop losing the answer; it cannot also decide which
+ * of the model's sentences were meant out loud.
+ *
+ * Joined with a blank line: these were separate messages and reading them as one
+ * paragraph would merge an aside into the answer.
+ */
+export function runAssistantText(messages: readonly unknown[]): string {
+  return runAssistantTexts(messages).join('\n\n');
+}
+
+/**
+ * The same messages, still separate.
+ *
+ * The parts have to survive as parts as far as the sender, because the
+ * duplicate-suppression registry is keyed on the exact text of what was sent
+ * (`SentRegistry.normalize`). A run where the model called `prinny(reply)` and
+ * ALSO wrote the same sentence as ordinary text produces a joined blob that
+ * matches nothing in the registry — so the sender would get the answer twice,
+ * once alone and once inside the blob. `finalAssistantText` never had that
+ * problem because it returned exactly one message's text.
+ *
+ * So `forwardToMatrix` drops the parts that room has already seen and joins what
+ * is left. That decision needs a room, and this module does not have one; this
+ * is where the split lives.
+ */
+export function runAssistantTexts(messages: readonly unknown[]): string[] {
+  if (endedWithoutAnswering(messages)) return [];
+
+  // Walk back for the boundary first, then forward, so the result is in the
+  // order the model said it. Doing it in one backward pass and reversing would
+  // work too; this is the version that reads like what it does.
+  let start = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const value = messages[index] as { role?: unknown } | undefined;
+    if (value?.role === 'user') {
+      start = index + 1;
+      break;
+    }
+  }
+
+  const parts: string[] = [];
+  for (let index = start; index < messages.length; index += 1) {
+    const text = assistantTextOfMessage(messages[index]);
+    // A model that repeats itself verbatim across two messages said it once as
+    // far as the sender is concerned.
+    if (text && !parts.includes(text)) parts.push(text);
+  }
+  return parts;
+}
+
+/**
  * A background subagent's result, injected into a run that was already going.
  *
  * `pi-subagents-lite`'s `SpawnCoordinator.emitIndividualNudge` sends it with

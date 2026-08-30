@@ -102,11 +102,23 @@ export type PermissionMode = 'off' | 'dangerous' | 'all';
  * content kind added by a future pi is excluded by default rather than leaked.
  *
  * - `off`     nothing is sent unless the model calls `prinny` with action `reply`.
- * - `result`  the closing text of each Matrix-originated turn (the default).
+ * - `result`  everything the model said in that turn, in order, as one message
+ *             when the turn settles (the default).
+ * - `last`    only the closing text of the turn. This was `result`'s behaviour
+ *             until 2026-08-30, and it loses the answer whenever a turn does not
+ *             end on it — a tool call mid-turn is enough, because pi starts a new
+ *             assistant message after every one. Kept because it is the narrowest
+ *             thing that can reach a stranger, and a session that wants that
+ *             should be able to have it. See `runAssistantText` in forwarding.ts
+ *             for the measured incident.
  * - `all`     every assistant text message in the turn, as it completes, so the
  *             sender sees progress on a long task instead of silence.
+ *
+ * `result` and `all` now carry the same text; they differ in WHEN and in HOW
+ * MANY Matrix messages it becomes — `all` streams one per assistant message
+ * during the run, `result` sends one message after it settles.
  */
-export type ForwardMode = 'off' | 'result' | 'all';
+export type ForwardMode = 'off' | 'result' | 'last' | 'all';
 
 export type PiSettings = {
   deliverAs: DeliverAs;
@@ -146,7 +158,7 @@ export const DEFAULT_SETTINGS: PiSettings = {
 };
 
 const DELIVER_AS: DeliverAs[] = ['followUp', 'steer'];
-const FORWARD_MODES: ForwardMode[] = ['off', 'result', 'all'];
+const FORWARD_MODES: ForwardMode[] = ['off', 'result', 'last', 'all'];
 const PERMISSION_MODES: PermissionMode[] = ['off', 'dangerous', 'all'];
 
 /**

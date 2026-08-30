@@ -80,7 +80,9 @@ Matrix client, and it accepts while the policy is `pairing`.
 How much of the answer goes to Matrix by itself:
 
 ```
-/prinny forward result   # the turn's closing text  (default)
+/prinny forward result   # everything said in the turn, in order, as one message (default)
+/prinny forward last     # only the turn's closing text — loses the answer when
+                         # the turn does not end on it (a mid-turn tool call is enough)
 /prinny forward all      # every assistant message as it completes
 /prinny forward off      # nothing unless the model calls prinny_reply
 ```

@@ -100,6 +100,7 @@ import {
   blockMatches,
   describeEmptyEnding,
   finalAssistantText,
+  runAssistantTexts,
   resolveActionRoom,
 } from '../src/forwarding.ts';
 import { beginCompaction, compactionInFlight, endCompaction, PRINNY_OWNER } from '../src/compaction-lock.ts';
@@ -248,8 +249,16 @@ const awaitingReply = new Map<
     undeliveredReported?: boolean;
   }
 >();
-/** The assistant's closing text from the last completed run. */
-let lastAssistantText = '';
+/**
+ * Everything the assistant said in the last completed run, in order.
+ *
+ * Was the run's CLOSING text until 2026-08-30, which silently dropped the answer
+ * whenever a turn did not end on it — see `runAssistantText` in
+ * ../src/forwarding.ts for the measured incident and for what widening it costs.
+ */
+let lastAssistantParts: string[] = [];
+/** The same run's closing text alone, for `forward: "last"`. */
+let lastFinalAssistantText = '';
 /**
  * Whether the last run ended with the model producing nothing.
  *
@@ -614,12 +623,13 @@ function detachSession(reason: string): void {
   // Run-scoped state, all of it about a run that will never finish. Left behind,
   // every one of these is a claim about the new session that came from the old:
   // `alreadySent` would suppress a forward that has not happened in this session,
-  // `lastAssistantText` would be offered as this session's answer, and
+  // `lastAssistantParts` would be offered as this session's answer, and
   // `lastRunEmptyEnding` would have `agent_settled` diagnose a turn that belonged
   // to somebody else.
   alreadySent.clear();
   unattributableThisRun = false;
-  lastAssistantText = '';
+  lastAssistantParts = [];
+  lastFinalAssistantText = '';
   lastRunEmptyEnding = { empty: false };
   lastInbound = {};
   agentRunning = false;
@@ -1216,9 +1226,21 @@ function liveRooms(): string[] {
   return [...awaitingReply.entries()].filter(([, entry]) => entry.live).map(([room]) => room);
 }
 
-async function forwardToMatrix(text: string, why: string): Promise<void> {
-  const trimmed = text.trim();
-  if (!trimmed) return;
+/**
+ * Send assistant text to the one room that is owed it.
+ *
+ * `text` may be a single string or the run's messages as separate PARTS. Parts
+ * are not joined until after the room is known, because duplicate suppression is
+ * keyed on the exact text of what was already sent: a run where the model called
+ * `prinny(reply)` and then also wrote the same sentence as ordinary text would
+ * otherwise arrive twice, once alone and once inside the joined blob. Filtering
+ * first is the whole reason `runAssistantTexts` returns an array.
+ */
+async function forwardToMatrix(text: string | readonly string[], why: string): Promise<void> {
+  const parts = (Array.isArray(text) ? text : [text as string])
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (parts.length === 0) return;
 
   const rooms = liveRooms();
   if (rooms.length === 0) return;
@@ -1237,6 +1259,13 @@ async function forwardToMatrix(text: string, why: string): Promise<void> {
   }
 
   const room = rooms[0]!;
+  // Per part, against the room that is about to receive it. Everything this
+  // room has already seen — from a `prinny(reply)` call, or from a `forward:
+  // "all"` streamed send — is dropped, and if that leaves nothing there is
+  // nothing to send.
+  const unsent = parts.filter((part) => !alreadySent.has(room, part));
+  if (unsent.length === 0) return;
+  const trimmed = unsent.join('\n\n');
   if (alreadySent.has(room, trimmed)) return;
   if (!child?.running) {
     log(`forward skipped (${why}) for ${room}: the channel is not running`);
@@ -1256,7 +1285,10 @@ async function forwardToMatrix(text: string, why: string): Promise<void> {
         : {}),
     });
     if (pending) pending.answered = true;
+    // The join AND each part. The join is what a later identical send would
+    // present; the parts are what a `prinny(reply)` of one of them would.
     alreadySent.mark(room, trimmed);
+    for (const part of unsent) alreadySent.mark(room, part);
     log(`forwarded ${trimmed.length} chars to ${room} (${why})`);
   } catch (err) {
     log(`forwarding to ${room} failed (${why}): ${err}`);
@@ -1371,8 +1403,10 @@ function stopTyping(): void {
  * the session. See standAside in ../src/compaction-request.ts (AE2).
  */
 async function forwardResult(): Promise<boolean> {
-  if (settings.forward === 'result' && lastAssistantText) {
-    await forwardToMatrix(lastAssistantText, 'turn result');
+  if (settings.forward === 'result' && lastAssistantParts.length > 0) {
+    await forwardToMatrix(lastAssistantParts, 'turn result');
+  } else if (settings.forward === 'last' && lastFinalAssistantText) {
+    await forwardToMatrix(lastFinalAssistantText, 'turn last');
   }
   // The run ended with the model saying nothing. Nothing was sent — see
   // finalAssistantText — but the operator should know, because from Matrix this
@@ -2042,7 +2076,7 @@ Access
 Settings
   /prinny set <key> <value>     channel: ${store.CHANNEL_SETTING_KEYS.join(', ')}
                                 pi: ${SETTING_KEYS.join(', ')}
-  /prinny forward <off|result|all>
+  /prinny forward <off|result|last|all>
                                 how much of the answer goes to Matrix by itself
   /prinny permissions <off|dangerous|all>
 
@@ -2612,7 +2646,12 @@ export default function prinnyChannel(pi: ExtensionAPI): void {
 
   pi.on('agent_end', async (event: AgentEndEvent) => {
     const messages = event.messages ?? [];
-    lastAssistantText = finalAssistantText(messages);
+    // Both, because `forwardResult` chooses between them by mode and
+    // `agent_settled` does not carry the messages to compute the other one from.
+    // Kept as PARTS: the duplicate-suppression registry is keyed on the exact
+    // text of what was sent, so the filtering has to happen before the join.
+    lastAssistantParts = runAssistantTexts(messages);
+    lastFinalAssistantText = finalAssistantText(messages);
     lastRunEmptyEnding = describeEmptyEnding(messages, contextPercent());
   });
 

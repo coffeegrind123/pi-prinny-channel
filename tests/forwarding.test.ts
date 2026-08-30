@@ -18,6 +18,8 @@ import {
   endedWithoutAnswering,
   finalAssistantText,
   resolveActionRoom,
+  runAssistantText,
+  runAssistantTexts,
 } from '../src/forwarding.ts';
 import { renderInboundMessage } from '../src/inbound.ts';
 
@@ -115,6 +117,105 @@ describe('finalAssistantText', () => {
   it('returns nothing when the run produced no text at all', () => {
     expect(finalAssistantText([{ role: 'user', content: 'hi' }])).toBe('');
     expect(finalAssistantText([])).toBe('');
+  });
+});
+
+describe('runAssistantText — the whole run, not just its last word', () => {
+  // The measured incident, 2026-08-30, with a persona active. The sender got the
+  // boop and an emoji reaction; the greeting was message one of five.
+  const theIncident = [
+    { role: 'user', content: [{ type: 'text', text: '[matrix] haiii' }] },
+    assistant([{ type: 'text', text: '*ears perk up* H-hi!! ... m-master?' }]),
+    assistant([{ type: 'text', text: 'Hi, this is a simple greeting in the persona.' }]),
+    assistant([{ type: 'toolCall', id: 't', name: 'prinny', arguments: { action: 'react' } }]),
+    { role: 'toolResult', content: [{ type: 'text', text: 'reacted' }] },
+    assistant([{ type: 'text', text: "I've already sent my reply." }]),
+    assistant([{ type: 'text', text: '*boops head, waits patiently* 🦊' }]),
+  ];
+
+  it('keeps the answer a mid-turn tool call would have buried', () => {
+    // What shipped before: the last text, alone.
+    expect(finalAssistantText(theIncident)).toBe('*boops head, waits patiently* 🦊');
+    // What ships now.
+    const parts = runAssistantTexts(theIncident);
+    expect(parts.length).toBe(4);
+    expect(parts[0]).toBe('*ears perk up* H-hi!! ... m-master?');
+    expect(parts[3]).toBe('*boops head, waits patiently* 🦊');
+  });
+
+  it('preserves the order the model said things in', () => {
+    const joined = runAssistantText(theIncident);
+    expect(joined.indexOf('ears perk up') < joined.indexOf('boops head')).toBe(true);
+    expect(joined.includes('\n\n')).toBe(true);
+  });
+
+  // Every boundary finalAssistantText enforces, enforced here too. Each was
+  // bought by an incident; a wider collector must not spend them again.
+  it('stops at the sender\'s own question, so an earlier exchange is not resent', () => {
+    const messages = [
+      assistant([{ type: 'text', text: 'answer to something else entirely' }]),
+      { role: 'user', content: [{ type: 'text', text: '[matrix] and now this' }] },
+      assistant([{ type: 'text', text: 'the answer they asked for' }]),
+    ];
+    expect(runAssistantTexts(messages)).toEqual(['the answer they asked for']);
+  });
+
+  it('refuses an empty final turn rather than reaching back for a thinking trace', () => {
+    // The incident in finalAssistantText's header: a filled window, content: [],
+    // and a mid-investigation deliberation delivered to somebody's phone.
+    const messages = [
+      assistant([{ type: 'text', text: 'I need to investigate further. Let me check.' }]),
+      assistant([]),
+    ];
+    expect(finalAssistantText(messages)).toBe('');
+    expect(runAssistantTexts(messages)).toEqual([]);
+    expect(runAssistantText(messages)).toBe('');
+  });
+
+  it('forwards text only — never thinking, never tool calls', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'q' }] },
+      assistant([
+        { type: 'thinking', thinking: 'the user seems to want X, I should be careful' },
+        { type: 'text', text: 'the visible answer' },
+      ]),
+      assistant([{ type: 'toolCall', id: 't', name: 'bash', arguments: { command: 'ls' } }]),
+    ];
+    const joined = runAssistantText(messages);
+    expect(joined).toBe('the visible answer');
+    expect(joined.includes('I should be careful')).toBe(false);
+  });
+
+  it('says a repeated sentence once', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'q' }] },
+      assistant([{ type: 'text', text: 'same' }]),
+      assistant([{ type: 'text', text: 'same' }]),
+    ];
+    expect(runAssistantTexts(messages)).toEqual(['same']);
+  });
+
+  it('is unchanged for the ordinary run that answers once', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'q' }] },
+      assistant([{ type: 'text', text: 'two files: a.ts and b.ts' }]),
+    ];
+    expect(runAssistantText(messages)).toBe(finalAssistantText(messages));
+  });
+
+  it('returns parts, because the duplicate registry is keyed on exact text', () => {
+    // The regression this split exists to prevent: the model calls
+    // prinny(reply) with one sentence and also writes it as text. A joined blob
+    // matches nothing in the registry, and the sender gets it twice.
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'q' }] },
+      assistant([{ type: 'text', text: 'already sent by the tool' }]),
+      assistant([{ type: 'text', text: 'and this part was not' }]),
+    ];
+    const sent = new SentRegistry();
+    sent.mark('!room:x', 'already sent by the tool');
+    const unsent = runAssistantTexts(messages).filter((part) => !sent.has('!room:x', part));
+    expect(unsent).toEqual(['and this part was not']);
   });
 });
 

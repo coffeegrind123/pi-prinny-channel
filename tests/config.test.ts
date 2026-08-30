@@ -77,7 +77,7 @@ describe('parseSetting', () => {
     const outcome = parseSetting('forward', 'sometimes');
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
-      expect(outcome.error).toContain('off | result | all');
+      expect(outcome.error).toContain('off | result | last | all');
       expect(outcome.error).toContain('sometimes');
     }
   });

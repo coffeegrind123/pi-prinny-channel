@@ -2214,3 +2214,91 @@ as `local` for the same reason `/compact` does, the dispatch form `/prinny new`
 is refused from Matrix, and — because a list like this widens quietly at its
 edges — the neighbours `/fork`, `/resume`, `/quit`, `/session` and `/tree` are
 still refused. 593/593 unit, 5/5 e2e.
+
+## AQ1 — the answer was message one of five, and the boop was message five
+
+Reported from a live session, 2026-08-30, with a persona active
+(`vendor/pi-persona`). One inbound `haiii`; the sender got a fox emoji reaction
+and the single line `*boops head, waits patiently* 🦊`. The actual greeting never
+left the box.
+
+The run, off the transcript:
+
+```
+  user       [matrix] haiii
+  assistant  "*ears perk up* H-hi!! ... m-master?"        <- the reply
+  assistant  "Hi, this is a simple greeting in the ..."   <- planning, as TEXT
+  assistant  toolCall prinny(react)
+  toolResult reacted
+  assistant  "I've already sent my reply. ..."            <- harness meta
+  assistant  "*boops head, waits patiently* 🦊"            <- forwarded, alone
+```
+
+`forward: "result"` sent `finalAssistantText(messages)`, which walks **back** from
+the end and returns the last assistant message that had any text. That is
+message five.
+
+**The cause is not the persona, and it is not a rare shape.** pi starts a new
+assistant message after every tool call, so *any* turn that reacts, replies,
+reads a file, or greps mid-answer ends with its real answer above the last text
+rather than in it. `finalAssistantText` is correct for a run that answers once and
+stops, and it silently drops the answer for every run that does not. Nothing in
+the log said so: the forward was logged as a success, because one had happened.
+
+**`forward: "result"` now sends the whole run, in order, as one message**
+(`runAssistantTexts` / `runAssistantText`). The old behaviour is kept as
+`forward: "last"` rather than deleted — it is the narrowest thing that can reach
+a stranger, and a session that wants exactly that should be able to have it.
+
+Every boundary `finalAssistantText` enforces is enforced by the new collector,
+because each was bought by an incident and a wider collector must not spend them
+again:
+
+| boundary | why it is there |
+| --- | --- |
+| `endedWithoutAnswering` first | an empty final turn means the model produced nothing, not that the answer is further up — the run that delivered a mid-investigation thinking trace to somebody's phone |
+| a `user` message ends the walk | that is the sender's own question; above it is an earlier exchange, and is not theirs |
+| `text` blocks only | the allowlist, so `thinking` and a content kind pi has not shipped yet are excluded by default |
+
+### What this widens, said plainly
+
+Every text the model emits in the run now reaches Matrix, **including text it
+wrote to itself**. Two of the five messages above are things the sender should
+never see — a planning note and a remark about having already sent something.
+Neither is a `thinking` block, so no allowlist in this package can catch them:
+they arrived as ordinary assistant text.
+
+That is a violation of the persona contract (`vendor/pi-persona`'s hedge pattern
+3, "stepping outside the persona") rather than of this package, and the fix for
+it belongs in the prompt. **This was the trade the operator was offered and
+took**, with the leak named first. Recorded here so that a later reader does not
+find the widening and assume nobody looked.
+
+### The duplicate the split exists to prevent
+
+`SentRegistry` is keyed on the exact normalised text of what was sent. A joined
+blob matches nothing in it, so a run where the model called `prinny(reply)` with
+one sentence and also wrote that sentence as ordinary text would have sent it
+twice — once alone, once inside the blob. `finalAssistantText` never had that
+problem because it returned exactly one message's text.
+
+So `runAssistantTexts` returns the parts, `forwardToMatrix` takes
+`string | readonly string[]`, and the filtering happens **after** the room is
+known and **before** the join. Both the join and each part are marked as sent, so
+a later `prinny(reply)` of one line is suppressed too. Consecutive verbatim
+repeats are collapsed: a model that says the same sentence twice said it once as
+far as the sender is concerned.
+
+### Tests
+
+**601, up from 594.** Eight new in `tests/forwarding.test.ts`, driven by the
+incident above as a fixture: that `finalAssistantText` still returns the boop
+alone and `runAssistantTexts` returns four parts starting with the greeting;
+order; each of the three boundaries above, including the empty-final-turn refusal
+asserted against *both* functions; text-only; the repeat collapse; that an
+ordinary one-answer run is byte-identical to what shipped before; and the
+registry filter that stops the duplicate.
+
+One existing test changed rather than broke: `config.test.ts` pins the enum the
+error message advertises, which is now `off | result | last | all`. That is the
+test doing its job.
