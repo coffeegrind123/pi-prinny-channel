@@ -2031,6 +2031,42 @@ const FORMAT = StringEnum(['markdown', 'text', 'html'], {
 });
 
 /** One place to turn a sidecar tool result into what pi hands the model. */
+/**
+ * A plain message back to the model, in the shape pi's UI requires.
+ *
+ * WHY THIS EXISTS — a bare string return CRASHES THE WHOLE SESSION.
+ *
+ * pi renders a tool result with `getTextOutput`, which reads
+ * `result.content.filter(...)` behind a `if (!result) return ""` guard. A
+ * non-empty string is TRUTHY, so the guard passes and `"...".content` is
+ * undefined:
+ *
+ *     TypeError: Cannot read properties of undefined (reading 'filter')
+ *       at getTextOutput -> ToolExecutionComponent.createResultFallback
+ *       -> updateDisplay -> updateResult -> handleEvent
+ *
+ * It arrives as an `uncaughtException` and takes the session with it. Observed
+ * 2026-08-30 on `prinny({action:'status'})`: the immersion throttle refused
+ * (one status change per 10 minutes), that path returned `verdict.reason` as a
+ * bare string, and pi died mid-turn. The persisted transcript shows
+ * `content: []` because the SESSION writer normalises while the UI event does
+ * not -- so the stored record looks harmless and hides the cause.
+ *
+ * This is not a pi bug that will be fixed. It has been reported upstream at
+ * least seven times (earendil-works/pi #5266, #5588, #5599, #6678, #6788,
+ * #7695, #7764) and closed `no-action` every time, with the maintainer's stated
+ * position: "this is a typescript code base, which does not do any defense
+ * checks like you propose, because they show up as compile time errors if you
+ * use the type system." So honouring the type is OUR job, here.
+ *
+ * Every early return in `execute` must go through this. `callSidecar` below
+ * already returns the same shape, which is why its returns were never the ones
+ * that crashed.
+ */
+function say(text: string): { content: Array<{ type: 'text'; text: string }>; details: unknown } {
+  return { content: [{ type: 'text' as const, text }], details: { tool: 'prinny' } };
+}
+
 async function callSidecar(
   name: string,
   args: Record<string, unknown>
@@ -2128,7 +2164,7 @@ function registerTools(pi: ExtensionAPI): void {
     async execute(_id, params) {
       const spec = ACTIONS[params.action as string];
       if (!spec) {
-        return `Unknown action ${String(params.action)}. Valid: ${Object.keys(ACTIONS).join(', ')}.`;
+        return say(`Unknown action ${String(params.action)}. Valid: ${Object.keys(ACTIONS).join(', ')}.`);
       }
 
       const args = { ...((params.args ?? {}) as Record<string, unknown>) };
@@ -2144,12 +2180,12 @@ function registerTools(pi: ExtensionAPI): void {
         lastInbound: lastInbound.room,
         liveRooms: liveRooms(),
       });
-      if ('refuse' in resolved) return resolved.refuse;
+      if ('refuse' in resolved) return say(resolved.refuse);
       const room = resolved.room;
       args.room_id = room;
       if ((params.action === 'react' || params.action === 'download') && !args.message_id) {
         if (!lastInbound.messageId) {
-          return `prinny(${params.action}) needs a message_id and none is known for this turn.`;
+          return say(`prinny(${params.action}) needs a message_id and none is known for this turn.`);
         }
         args.message_id = lastInbound.messageId;
       }
@@ -2161,7 +2197,7 @@ function registerTools(pi: ExtensionAPI): void {
       if (params.action === 'status' || params.action === 'topic') {
         const act = params.action as ImmersionAct;
         const verdict = checkImmersion(act, lastImmersionAt[act], Date.now());
-        if (!verdict.allowed) return verdict.reason;
+        if (!verdict.allowed) return say(verdict.reason);
 
         if (act === 'status') {
           // The model's status is the PERSONA's, and it outlives the run: the

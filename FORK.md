@@ -2718,3 +2718,69 @@ A homeserver without MSC4133 answers `M_UNRECOGNIZED`, and that is reported as a
 deployment fact rather than a bug.
 
 658 tests, up from 657.
+
+## A bare string killed the session (2026-08-31)
+
+`prinny({action:'status'})` — the persona setting its own Matrix status line —
+took the whole pi session down with an `uncaughtException`:
+
+```
+TypeError: Cannot read properties of undefined (reading 'filter')
+  at getTextOutput
+  at ToolExecutionComponent.createResultFallback
+  at ToolExecutionComponent.updateDisplay
+  at _InteractiveMode.handleEvent
+```
+
+**The mechanism.** pi renders a tool result with
+
+```js
+if (!result) return "";
+let textBlocks = result.content.filter(...)
+```
+
+The guard covers a missing result, not a result without `content`. A non-empty
+**string is truthy**, so returning one walks past the guard into
+`"...".content.filter(...)`. Four returns in the tool's `execute` did exactly
+that: the unknown-action message, `resolved.refuse`, the missing-`message_id`
+message, and `verdict.reason`.
+
+**Why `status` specifically.** It is throttled to one change per 10 minutes
+(`src/immersion-acts.ts`). The throttle refused, that branch returned
+`verdict.reason` as a bare string, and the session died mid-turn. Any of the
+other three would have done the same; this is just the one that fired first.
+
+**The transcript actively misleads.** The stored record reads
+`{"toolName":"prinny","content":[],"isError":false}` — harmless-looking, and it
+does not contain the string that caused the crash. pi's SESSION WRITER
+normalises the result; the UI event does not. Read the stack trace, not the
+session file.
+
+**This is not going to be fixed upstream, and it is not a bug there.** Reported
+at least seven times — earendil-works/pi #5266, #5588, #5599, #6678, #6788,
+#7695, #7764 — and closed `no-action` every time. #6788 describes this exact
+path ("emitToolExecutionEnd drops content normalization, crashes UI on extension
+tools without content"). The maintainer's position, verbatim:
+
+> stop ignoring the types in the type system and you will not get a crash. this
+> is a typescript code base, which does not do any defense checks like you
+> propose, because they show up as compile time errors if you use the type
+> system.
+
+So honouring the declared type is ours to do, at every return. There is no
+eighth issue to file.
+
+**The fix** is a `say()` helper returning `{ content: [{ type: 'text', text }],
+details }` — the shape `callSidecar` already returned, which is why the two
+returns that went through it never crashed — and all four bare returns now go
+through it.
+
+**Not changed on purpose:** `handleCommand` is typed `Promise<string>` and feeds
+`registerCommand`. Slash commands render through a different path and a string
+is correct there. Only the TOOL is constrained.
+
+`tests/tool-result-shape.test.ts` scans every `return` in the handler and fails
+on any that is neither `say(...)` nor an already-shaped value. Controlled: three
+of its four cases fail against the pre-fix file.
+
+662 tests, up from 658.
