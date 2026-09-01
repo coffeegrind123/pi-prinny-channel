@@ -159,6 +159,7 @@ import {
 import { renderInboundMessage, roomOf, uniqueInjection, type ChannelMessage } from '../src/inbound.ts';
 import { planStopAll, planTyping } from '../src/typing.ts';
 import { McpChild, resultText } from '../src/mcp-stdio.ts';
+import { unwrapDoubleArgs } from '../src/tool-args.ts';
 import {
   describeCall,
   markApproved,
@@ -2167,7 +2168,7 @@ function registerTools(pi: ExtensionAPI): void {
         return say(`Unknown action ${String(params.action)}. Valid: ${Object.keys(ACTIONS).join(', ')}.`);
       }
 
-      const args = { ...((params.args ?? {}) as Record<string, unknown>) };
+      const args = unwrapDoubleArgs(params.args);
       // The routing identifiers the model no longer sees. An explicit value
       // still wins, so history/search on some OTHER room stays possible.
       //

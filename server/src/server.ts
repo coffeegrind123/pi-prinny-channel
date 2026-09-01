@@ -83,6 +83,7 @@ import {
   type Access,
 } from './access.js';
 import { connectWithRetry } from './connect.js';
+import { requiredParamError, type RequiredSchema } from './required.js';
 import { fetchMessages, renderHistory, searchMessages } from './history.js';
 import {
   MAX_ATTACHMENT_BYTES,
@@ -564,8 +565,15 @@ const ROOM_ID_SCHEMA = {
   description: 'Matrix room ID from the inbound <channel> block, e.g. !abc:example.org',
 } as const;
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+/**
+ * The tool surface, hoisted out of the ListTools handler.
+ *
+ * It is declared here rather than inline because the CALL handler needs it too:
+ * `assertRequired` below checks an incoming call against the very `required`
+ * array this list advertises, so the promise made to the model and the check
+ * made on its behalf cannot drift apart.
+ */
+const TOOLS = [
     {
       name: 'reply',
       description:
@@ -696,7 +704,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           room_id: ROOM_ID_SCHEMA,
           message_id: { type: 'string' },
-          emoji: { type: 'string' },
+          // minLength, because an empty reaction key is refused by the
+          // homeserver with the same opaque 400 as a missing one — and because
+          // `required` alone does not say that. Deliberately NOT set on
+          // `set_biography`/`set_topic`/`set_bot_profile`, whose empty string
+          // means "clear it", nor on reply/edit text.
+          emoji: { type: 'string', minLength: 1 },
         },
         required: ['room_id', 'message_id', 'emoji'],
       },
@@ -750,14 +763,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           room_id: ROOM_ID_SCHEMA,
-          query: { type: 'string' },
+          // Same reason as react's emoji: an empty search is not a search,
+          // and `required` on its own does not say so.
+          query: { type: 'string', minLength: 1 },
           limit: { type: 'number', description: 'Max results. Default 20, max 200.' },
         },
         required: ['room_id', 'query'],
       },
     },
-  ],
-}));
+] as const;
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS as unknown as object[] }));
+
+/**
+ * Refuse a call that is missing a parameter this tool said it required.
+ *
+ * The decision lives in `./required.ts`, which imports nothing and is unit
+ * tested — this file cannot be, because loading it stands the MCP server up on
+ * stdio. What stays here is the lookup, because the schema being checked is the
+ * one this same file publishes in `TOOLS` above: the promise made to the model
+ * and the check made on its behalf cannot drift apart.
+ */
+function assertRequired(toolName: string, args: Record<string, unknown>): void {
+  const tool = TOOLS.find((t) => t.name === toolName);
+  const message = requiredParamError(toolName, tool?.inputSchema as RequiredSchema | undefined, args);
+  if (message) throw new Error(message);
+}
 
 function parseMode(format: unknown): MessageOptions['parse_mode'] {
   if (format === 'text') return 'None';
@@ -772,6 +803,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const roomId = (args.room_id ?? args.chat_id) as string;
 
   try {
+    // Before the switch, so every case gets it and no future case can forget.
+    // `room_id` is filled in by the extension for every action, so this fires
+    // on the parameters the MODEL supplies and not on the routing ones.
+    assertRequired(req.params.name, { ...args, room_id: roomId });
+
     switch (req.params.name) {
       case 'reply': {
         const text = args.text as string;
