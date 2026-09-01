@@ -1,0 +1,15 @@
+# Line endings are LF everywhere, decided here rather than by each clone.
+#
+# WHY THIS FILE EXISTS. Git for Windows ships 'core.autocrlf=true' in the GLOBAL
+# config, and a submodule does NOT inherit the superproject's local config — it
+# has its own '.git/config' and falls back to the global. So a checkout that had
+# been carefully set to LF converted this repo to CRLF the moment
+# 'git submodule update' touched a file, one file at a time as commits happened
+# to change them. Observed 2026-09-01: the parent stayed LF while
+# vendor/prinny-channel and vendor/pi-persona silently went CRLF, which broke a
+# source-assertion test and re-stamped the sidecar runtime's source fingerprint.
+#
+# 'text=auto eol=lf' is checked into the repo, so it beats any client config and
+# travels with a fresh clone on any platform. Nothing here is a Windows batch
+# file, so nothing needs CRLF.
+* text=auto eol=lf
